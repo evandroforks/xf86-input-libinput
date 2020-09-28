@@ -1651,6 +1651,7 @@ calculate_axis_value(struct xf86libinput *driver_data,
 		value = libinput_event_pointer_get_axis_value(event, axis);
 	}
 
+	value *= 3;
 	*value_out = value;
 
 	return true;
