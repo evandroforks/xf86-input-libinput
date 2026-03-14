@@ -33,7 +33,12 @@ AM_CPPFLAGS =-I$(top_srcdir)/include $(LIBINPUT_CFLAGS)
 @DRIVER_NAME@_drv_la_LIBADD = $(LIBINPUT_LIBS) libdraglock.la libbezier.la -lm
 @DRIVER_NAME@_drv_ladir = @inputdir@
 
-@DRIVER_NAME@_drv_la_SOURCES = xf86libinput.c
+@DRIVER_NAME@_drv_la_SOURCES = \
+	xf86libinput.c \
+	util-macros.h \
+	util-strings.h \
+	util-strings.c \
+	$(NULL)
 
 noinst_LTLIBRARIES = libdraglock.la libbezier.la
 libdraglock_la_SOURCES = draglock.c draglock.h

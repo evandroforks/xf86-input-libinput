@@ -23,7 +23,7 @@
 # Initialize Autoconf
 AC_PREREQ([2.60])
 AC_INIT([xf86-input-libinput],
-        [0.30.0],
+        [1.5.0],
         [https://gitlab.freedesktop.org/xorg/driver/xf86-input-libinput/issues],
         [xf86-input-libinput])
 AC_CONFIG_SRCDIR([Makefile.am])
@@ -31,14 +31,14 @@ AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_AUX_DIR(.)
 
 # Initialize Automake
-AM_INIT_AUTOMAKE([foreign dist-bzip2])
+AM_INIT_AUTOMAKE([foreign dist-xz])
 
 # Initialize libtool
 AC_DISABLE_STATIC
 LT_INIT
 
 # Initialize X.Org macros 1.8 or later for MAN_SUBSTS set by XORG_MANPAGE_SECTIONS
-m4_ifndef([XORG_MACROS_VERSION], 
+m4_ifndef([XORG_MACROS_VERSION],
           [m4_fatal([must install xorg-macros 1.8 or later before running autoconf/autogen])])
 XORG_MACROS_VERSION(1.8)
 XORG_DEFAULT_OPTIONS
@@ -46,6 +46,10 @@ XORG_DEFAULT_OPTIONS
 # Obtain compiler/linker options from server and required extensions
 PKG_CHECK_MODULES(XORG, [xorg-server >= 1.19] xproto [inputproto >= 2.2])
 PKG_CHECK_MODULES(LIBINPUT, [libinput >= 1.11.0])
+
+PKG_CHECK_MODULES(INPUTPROTO24, [inputproto >= 2.3.99.1],
+		  [AC_DEFINE(HAVE_INPUTPROTO24, [1], [inputproto 2.4 is available])],
+		  [:])
 
 OLD_LIBS=$LIBS
 OLD_CFLAGS=$CFLAGS
@@ -62,6 +66,51 @@ AC_LINK_IFELSE(
                 [libinput_have_scroll_button_lock=yes]],
                [AC_MSG_RESULT([no])
                 [libinput_have_scroll_button_lock=no]])
+
+AC_MSG_CHECKING([if libinput_event_pointer_get_scroll_value_v120 is available])
+AC_LINK_IFELSE(
+               [AC_LANG_PROGRAM([[#include <libinput.h>]],
+                                [[libinput_event_pointer_get_scroll_value_v120(NULL, 0)]])],
+               [AC_MSG_RESULT([yes])
+                AC_DEFINE(HAVE_LIBINPUT_AXIS_VALUE_V120, [1],
+                          [libinput_event_pointer_get_scroll_value_v120() is available])
+                [libinput_have_axis_value_v120=yes]],
+               [AC_MSG_RESULT([no])
+                [libinput_have_axis_value_v120=no]])
+
+AC_MSG_CHECKING([if libinput_config_accel_create is available])
+AC_LINK_IFELSE(
+               [AC_LANG_PROGRAM([[#include <libinput.h>]],
+                                [[libinput_config_accel_create(0)]])],
+               [AC_MSG_RESULT([yes])
+                AC_DEFINE(HAVE_LIBINPUT_CUSTOM_ACCEL, [1],
+                          [libinput_config_accel_create() is available])
+                [libinput_have_custom_accel=yes]],
+               [AC_MSG_RESULT([no])
+                [libinput_have_custom_accel=no]])
+
+AC_MSG_CHECKING([if libinput_tablet_tool_config_pressure_range_set is available])
+AC_LINK_IFELSE(
+               [AC_LANG_PROGRAM([[#include <libinput.h>]],
+                                [[libinput_tablet_tool_config_pressure_range_set(0)]])],
+               [AC_MSG_RESULT([yes])
+                AC_DEFINE(HAVE_LIBINPUT_PRESURE_RANGE, [1],
+                          [libinput_tablet_tool_config_pressure_range_set() is available])
+                [libinput_have_pressure_range=yes]],
+               [AC_MSG_RESULT([no])
+                [libinput_have_pressure_range=no]])
+
+AC_MSG_CHECKING([if libinput_device_config_click_set_clickfinger_button_map is available])
+AC_LINK_IFELSE(
+               [AC_LANG_PROGRAM([[#include <libinput.h>]],
+                                [[libinput_device_config_click_set_clickfinger_button_map(NULL, 0)]])],
+               [AC_MSG_RESULT([yes])
+                AC_DEFINE(HAVE_LIBINPUT_CLICKFINGER_BUTTON_MAP, [1],
+                          [libinput_device_config_click_set_clickfinger_button_map() is available])
+                [libinput_have_clickfinger_button_map=yes]],
+               [AC_MSG_RESULT([no])
+                [libinput_have_clickfinger_button_map=no]])
+
 LIBS=$OLD_LIBS
 CFLAGS=$OLD_CFLAGS
 

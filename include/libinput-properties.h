@@ -1,24 +1,26 @@
 /*
+ * SPDX-License-Identifier: MIT
+ *
  * Copyright © 2015 Red Hat, Inc.
  *
- * Permission to use, copy, modify, distribute, and sell this software
- * and its documentation for any purpose is hereby granted without
- * fee, provided that the above copyright notice appear in all copies
- * and that both that copyright notice and this permission notice
- * appear in supporting documentation, and that the name of Red Hat
- * not be used in advertising or publicity pertaining to distribution
- * of the software without specific, written prior permission.  Red
- * Hat makes no representations about the suitability of this software
- * for any purpose.  It is provided "as is" without express or implied
- * warranty.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * THE AUTHORS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
- * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
- * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
- * OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
- * NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
  */
 
 #ifndef _LIBINPUT_PROPERTIES_H_
@@ -49,6 +51,13 @@
 /* Tap button default order: BOOL, 2 values in order LRM, LMR, read-only */
 #define LIBINPUT_PROP_TAP_BUTTONMAP_DEFAULT "libinput Tapping Button Mapping Default"
 
+/* Clickfinger button order: BOOL, 2 values in order LRM, LMR, only one may be set
+   at any time */
+#define LIBINPUT_PROP_CLICKFINGER_BUTTONMAP "libinput Clickfinger Button Mapping Enabled"
+
+/* Clickfinger button default order: BOOL, 2 values in order LRM, LMR, read-only */
+#define LIBINPUT_PROP_CLICKFINGER_BUTTONMAP_DEFAULT "libinput Clickfinger Button Mapping Default"
+
 /* Calibration matrix: FLOAT, 9 values of a 3x3 matrix, in rows */
 #define LIBINPUT_PROP_CALIBRATION "libinput Calibration Matrix"
 
@@ -61,17 +70,35 @@
 /* Pointer accel speed: FLOAT, 1 value, 32 bit, read-only*/
 #define LIBINPUT_PROP_ACCEL_DEFAULT "libinput Accel Speed Default"
 
-/* Pointer accel profile: BOOL, 2 values in oder adaptive, flat,
+/* Pointer accel profile: BOOL, 3 values in order adaptive, flat, custom
  * only one is enabled at a time at max, read-only */
 #define LIBINPUT_PROP_ACCEL_PROFILES_AVAILABLE "libinput Accel Profiles Available"
 
-/* Pointer accel profile: BOOL, 2 values in order adaptive, flat,
+/* Pointer accel profile: BOOL, 3 values in order adaptive, flat, custom
    only one is enabled at a time at max, read-only */
 #define LIBINPUT_PROP_ACCEL_PROFILE_ENABLED_DEFAULT "libinput Accel Profile Enabled Default"
 
-/* Pointer accel profile: BOOL, 2 values in order adaptive, flat,
+/* Pointer accel profile: BOOL, 3 values in order adaptive, flat, custom
    only one is enabled at a time at max */
 #define LIBINPUT_PROP_ACCEL_PROFILE_ENABLED "libinput Accel Profile Enabled"
+
+/* Points for the custom accel profile: FLOAT, N values */
+#define LIBINPUT_PROP_ACCEL_CUSTOM_POINTS_FALLBACK "libinput Accel Custom Fallback Points"
+
+/* Steps for the custom accel profile: FLOAT, 1 value */
+#define LIBINPUT_PROP_ACCEL_CUSTOM_STEP_FALLBACK "libinput Accel Custom Fallback Step"
+
+/* Points for the custom accel profile: FLOAT, N values */
+#define LIBINPUT_PROP_ACCEL_CUSTOM_POINTS_MOTION "libinput Accel Custom Motion Points"
+
+/* Steps for the custom accel profile: FLOAT, 1 value */
+#define LIBINPUT_PROP_ACCEL_CUSTOM_STEP_MOTION "libinput Accel Custom Motion Step"
+
+/* Points for the custom accel profile: FLOAT, N values */
+#define LIBINPUT_PROP_ACCEL_CUSTOM_POINTS_SCROLL "libinput Accel Custom Scroll Points"
+
+/* Steps for the custom accel profile: FLOAT, 1 value */
+#define LIBINPUT_PROP_ACCEL_CUSTOM_STEP_SCROLL "libinput Accel Custom Scroll Step"
 
 /* Natural scrolling: BOOL, 1 value */
 #define LIBINPUT_PROP_NATURAL_SCROLL "libinput Natural Scrolling Enabled"
@@ -120,6 +147,12 @@
 
 /* Scroll button lock: BOOL, 1 value, TRUE for enabled, FALSE otherwise, read-only*/
 #define LIBINPUT_PROP_SCROLL_BUTTON_LOCK_DEFAULT "libinput Button Scrolling Button Lock Enabled Default"
+
+/* Scroll pixel distance: CARD32, 1 value (with implementation-defined limits) */
+#define LIBINPUT_PROP_SCROLL_PIXEL_DISTANCE "libinput Scrolling Pixel Distance"
+
+/* Scroll pixel distance: CARD32, 1 value, read-only */
+#define LIBINPUT_PROP_SCROLL_PIXEL_DISTANCE_DEFAULT "libinput Scrolling Pixel Distance Default"
 
 /* Click method: BOOL read-only, 2 values in order buttonareas, clickfinger
    shows available click methods */
@@ -196,7 +229,35 @@
  */
 #define LIBINPUT_PROP_TABLET_TOOL_PRESSURECURVE "libinput Tablet Tool Pressurecurve"
 
+/* Tablet tool pressure range: float, 2 values, 32 bit
+ * Value range is [0.0, 1.0] for min and max physical pressure to map to the logical range
+ * Default value: 0.0 1.0
+ */
+#define LIBINPUT_PROP_TABLET_TOOL_PRESSURE_RANGE "libinput Tablet Tool Pressure Range"
+
+/* Tablet tool pressure range: float, 2 values, 32 bit, read-only */
+#define LIBINPUT_PROP_TABLET_TOOL_PRESSURE_RANGE_DEFAULT "libinput Tablet Tool Pressure Range Default"
+
 /* Tablet tool area ratio: CARD32, 2 values, w and h */
 #define LIBINPUT_PROP_TABLET_TOOL_AREA_RATIO "libinput Tablet Tool Area Ratio"
+
+/* High-resolution wheel scroll events enabled: BOOL, 1 value (0 or 1).
+ * If disabled, high-resolution wheel scroll events are discarded */
+#define LIBINPUT_PROP_HIRES_WHEEL_SCROLL_ENABLED "libinput High Resolution Wheel Scroll Enabled"
+
+/* The tablet tool unique serial number: CARD32, 1 value, constant for the
+ * lifetime of the device.
+ *
+ * If this property exists and is zero, the tool does not have a unique serial
+ * number.
+ */
+#define LIBINPUT_PROP_TABLET_TOOL_SERIAL "libinput Tablet Tool Serial"
+
+/* The tablet tool hardware ID: CARD32, 1 value, constant for the lifetime of the device.
+ *
+ * This property only exists if the device has a known tool ID.
+ * See libinput_tablet_tool_get_tool_id() in the libinput documentation for details.
+ */
+#define LIBINPUT_PROP_TABLET_TOOL_ID "libinput Tablet Tool ID"
 
 #endif /* _LIBINPUT_PROPERTIES_H_ */

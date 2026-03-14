@@ -71,11 +71,11 @@ core
 *.tar.bz2
 *.tar.gz
 #
-#		Add & Override patterns for xf86-input-libinput 
+#		Add & Override patterns for xf86-input-libinput
 #
 #		Edit the following section as needed
 # For example, !report.pc overrides *.pc. See 'man gitignore'
-# 
+#
 *.log
 *.trs
 *.swp
@@ -84,3 +84,4 @@ core
 test-driver
 tags
 .vimdir
+test/test-bezier

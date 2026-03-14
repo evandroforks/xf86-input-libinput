@@ -1,6 +1,6 @@
 .\" shorthand for double quote that works everywhere.
 .ds q \N'34'
-.TH LIBINPUT __drivermansuffix__ __vendorversion__
+.TH LIBINPUT 4 @VERSION@
 .SH NAME
 libinput \- libinput-based X.Org input driver
 .SH SYNOPSIS
@@ -20,7 +20,7 @@ library documentation, go to
 
 .SH DESCRIPTION
 .B libinput
-is an __xservername__ input driver based on libinput.  It
+is an Xorg input driver based on libinput.  It
 therefore supports all input devices that libinput can handle, including
 most mice, keyboards, tablets and touchscreens.
 .PP
@@ -28,12 +28,12 @@ It is recommended that
 .B libinput
 devices are configured through the
 .B InputClass
-directive (refer to __xconfigfile__(__filemansuffix__)) instead of manual
+directive (refer to xorg.conf(5)) instead of manual
 per-device configuration. Devices configured in the
-__xconfigfile__(__filemansuffix__) are not hot-plug capable.
+xorg.conf(5) are not hot-plug capable.
 
 .SH CONFIGURATION DETAILS
-Please refer to __xconfigfile__(__filemansuffix__) for general configuration
+Please refer to xorg.conf(5) for general configuration
 details and for options that can be used with all input drivers.  This
 section only covers configuration details specific to this driver.
 .PP
@@ -45,17 +45,42 @@ are supported:
 Sets the pointer acceleration profile to the given profile. Permitted values
 are
 .BI adaptive,
-.BI flat.
+.BI flat,
+.BI custom.
 Not all devices support this option or all profiles. If a profile is
 unsupported, the default profile for this device is used. For a description
 on the profiles and their behavior, see the libinput documentation.
 .TP 7
 .BI "Option \*qAccelSpeed\*q \*q" float \*q
-Sets the pointer acceleration speed within the range [-1, 1]
+Sets the pointer acceleration speed within the range [-1, 1].
+This only applies to the flat or adaptive profile.
+.TP 7
+.BI "Option \*qAccelPointsFallback\*q \*q" string \*q
+.TQ
+.BI "Option \*qAccelPointsMotion\*q \*q" string \*q
+.TQ
+.BI "Option \*qAccelPointsScroll\*q \*q" string \*q
+Sets the points of the Fallback/Motion/Scroll acceleration functions.
+The string must be a space-separated list of floating point non-negative numbers, e.g.
+"0.0 1.0 2.4 2.5".
+This only applies to the custom profile.
+See section
+.B CUSTOM ACCELERATION PROFILE
+.TP 7
+.BI "Option \*qAccelStepFallback\*q \*q" float \*q
+.TQ
+.BI "Option \*qAccelStepMotion\*q \*q" float \*q
+.TQ
+.BI "Option \*qAccelStepScroll\*q \*q" float \*q
+Sets the step between the points of the Fallback/Motion/Scroll acceleration functions.
+When a step of 0.0 is provided, libinput's Fallback acceleration function is used.
+This only applies to the custom profile.
+See section
+.B CUSTOM ACCELERATION PROFILE
 .TP 7
 .BI "Option \*qButtonMapping\*q \*q" string \*q
 Sets the logical button mapping for this device, see
-XSetPointerMapping(__libmansuffix__). The string must be a
+XSetPointerMapping(3). The string must be a
 space-separated list of button mappings in the order of the
 logical buttons on the device, starting with button 1.
 The default mapping is "1 2 3 ... 32". A mapping of 0
@@ -114,11 +139,16 @@ device button numbers, i.e. the
 .B ButtonMapping
 applies after drag lock.
 .TP 7
+.BI "Option \*qHighResolutionWheelScrolling\*q \*q" bool \*q
+Disables high-resolution wheel scroll events, enabled by default. When enabled,
+the driver forwards only high-resolution wheel scroll events from libinput.
+When disabled, the driver forwards legacy wheel scroll events instead.
+.TP 7
 .BI "Option \*qHorizontalScrolling\*q \*q" bool \*q
-Disables horizontal scrolling. When disabled, this driver will discard any
-horizontal scroll events from libinput. Note that this does not disable
-horizontal scrolling, it merely discards the horizontal axis from any scroll
-events.
+Enables or disables horizontal scrolling. When disabled, this driver will
+discard any horizontal scroll events from libinput. This does not disable
+horizontal scroll events from libinput; it merely discards the horizontal axis
+from any scroll events. Default is enabled.
 .TP 7
 .BI "Option \*qLeftHanded\*q \*q" bool \*q
 Enables left-handed button orientation, i.e. swapping left and right buttons.
@@ -143,10 +173,10 @@ and the button is logically down, x/y axis movement is converted into
 scroll events.
 .TP 7
 .BI "Option \*qScrollButtonLock\*q \*q" bool \*q
-Enables or disables the scroll button lock. If enabled, the 
+Enables or disables the scroll button lock. If enabled, the
 .BI ScrollButton
 is considered logically down after the first click and remains down until
-the second click of that button. If disabled (the default), the 
+the second click of that button. If disabled (the default), the
 .BI ScrollButton
 button is considered logically down while held down and up once physically
 released.
@@ -160,6 +190,16 @@ Enables a scroll method. Permitted values are
 Not all devices support all options, if an option is unsupported, the
 default scroll option for this device is used.
 .TP 7
+.BI "Option \*qScrollPixelDistance\*q \*q" int \*q
+Sets the movement distance, in "pixels", required to trigger one logical
+wheel click. This option only applies to the scroll methods
+.BI twofinger,
+.BI edge,
+.BI button.
+See section
+.B SCROLL PIXEL DISTANCE
+for more details.
+.TP 7
 .BI "Option \*qSendEventsMode\*q \*q" (disabled|enabled|disabled-on-external-mouse) \*q
 Sets the send events mode to disabled, enabled, or "disable when an external
 mouse is connected".
@@ -169,6 +209,14 @@ Set the pressure curve for a tablet stylus to the bezier formed by the four
 points. The respective x/y coordinate must be in the [0.0, 1.0] range. For
 more information see section
 .B TABLET STYLUS PRESSURE CURVE.
+.TP 7
+.BI "Option \*qTabletToolPressureRange\*q \*q" "min max" \*q
+Set the pressure range for a tablet stylus to the given subset of the physical
+range. The min/max values must be in the [0.0, 1.0] range. For
+example a min of 0.3 means the tablet will send 0 pressure for anything equal
+or below 30% of the physical pressure range and a max of 0.7 means
+the tablet sends its maximum pressure value for any pressure equal or higher to
+70% of the physical pressure range.
 .TP 7
 .BI "Option \*qTabletToolAreaRatio\*q \*q" "w:h" \*q
 Sets the area ratio for a tablet tool. The area always starts at the
@@ -213,15 +261,41 @@ on the device. The following properties are provided by the
 driver.
 .TP 7
 .BI "libinput Accel Profiles Available"
-2 boolean values (8 bit, 0 or 1), in order "adaptive", "flat".
+3 boolean values (8 bit, 0 or 1), in order "adaptive", "flat", "custom".
 Indicates which acceleration profiles are available on this device.
 .TP 7
 .BI "libinput Accel Profile Enabled"
-2 boolean values (8 bit, 0 or 1), in order "adaptive", "flat".
+3 boolean values (8 bit, 0 or 1), in order "adaptive", "flat", "custom".
 Indicates which acceleration profile is currently enabled on this device.
 .TP 7
 .BI "libinput Accel Speed"
-1 32-bit float value, defines the pointer speed. Value range -1, 1
+1 32-bit float value, defines the pointer speed. Value range -1, 1.
+This only applies to the flat or adaptive profile.
+.TP 7
+.BI "libinput Accel Custom Fallback Points"
+.TQ
+.BI "libinput Accel Custom Motion Points"
+.TQ
+.BI "libinput Accel Custom Scroll Points"
+A space-separated list of 32-bit floating point non-negative numbers, e.g.
+"0.0 1.0 2.4 2.5".
+Sets the points of the Fallback/Motion/Scroll acceleration functions.
+This only applies to the custom profile.
+See section
+.B CUSTOM ACCELERATION PROFILE
+.TP 7
+.BI "libinput Accel Custom Fallback Step"
+.TQ
+.BI "libinput Accel Custom Motion Step"
+.TQ
+.BI "libinput Accel Custom Scroll Step"
+1 32-bit float value, sets the step between the points of the
+Fallback/Motion/Scroll acceleration functions.
+When a step of 0.0 is provided, libinput's Fallback acceleration
+function is used.
+This only applies to the custom profile.
+See section
+.B CUSTOM ACCELERATION PROFILE
 .TP 7
 .BI "libinput Button Scrolling Button"
 1 32-bit value. Sets the button number to use for button scrolling. This
@@ -252,7 +326,11 @@ button pairs. See section
 .B BUTTON DRAG LOCK
 for details.
 .TP 7
-.BI "libinput Horizontal Scrolling Enabled"
+.BI "libinput High Resolution Wheel Scroll Enabled"
+1 boolean value (8 bit, 0 or 1). Indicates whether high-resolution
+wheel scroll events are enabled or not.
+.TP 7
+.BI "libinput Horizontal Scroll Enabled"
 1 boolean value (8 bit, 0 or 1). Indicates whether horizontal scrolling
 events are enabled or not.
 .TP 7
@@ -278,6 +356,10 @@ Indicates which scroll methods are available on this device.
 .BI "libinput Scroll Method Enabled"
 3 boolean values (8 bit, 0 or 1), in order "two-finger", "edge", "button".
 Indicates which scroll method is currently enabled on this device.
+.TP 7
+.BI "libinput Scroll Pixel Distance"
+1 32-bit value (nonzero, with additional implementation-defined range checks).
+Changes the movement distance required to trigger one logical wheel click.
 .TP 7
 .BI "libinput Send Events Modes Available"
 2 boolean values (8 bit, 0 or 1), in order "disabled" and
@@ -332,14 +414,14 @@ button mapping of
 .B "\*q3 2 1 ...\*q"
 On systems using the
 .B libinput
-__xservername__ input driver it is recommended to use the
+Xorg input driver it is recommended to use the
 .B LeftHanded
 option instead.
 .PP
 The
 .B libinput
-__xservername__ input driver does not use the button mapping after setup.
-Use XSetPointerMapping(__libmansuffix__) to modify the button mapping at
+Xorg input driver does not use the button mapping after setup.
+Use XSetPointerMapping(3) to modify the button mapping at
 runtime.
 
 .SH BUTTON DRAG LOCK
@@ -396,13 +478,53 @@ it takes left-handed-ness into account.
 .TP
 This feature is provided by this driver, not by libinput.
 
+.SH SCROLL PIXEL DISTANCE
+The X server does not support per-pixel scrolling but it does support
+smooth scrolling. All scroll events however are based around a logical
+unit of scrolling (traditionally corresponding to a wheel click).
+It is thus not possible to scroll by 10 pixels, but it is possible for a
+driver to scroll by 1/10th of a logical wheel click.
+.PP
+libinput provides scroll data in pixels. The \fBScrollPixelDistance\fR
+option defines the amount of movement equivalent to one wheel click. For
+example, a value of 50 means the user has to move a finger by 50 pixels to
+generate one logical click event and each pixel is 1/50th of a wheel click.
+
+.SH CUSTOM ACCELERATION PROFILE
+The custom pointer acceleration profile gives users full control over the
+acceleration behavior at different speeds. libinput exposes an acceleration
+function f(x) where the x-axis is the device speed in device units per millisecond
+and the y-axis is the pointer speed.
+.PP
+The custom acceleration function is defined using n points which are spaced
+uniformly along the x-axis, starting from 0 and continuing in constant steps.
+Thus the points defining the custom function are:
+.EX
+(0 * step, f[0]), (1 * step, f[1]), ..., ((n-1) * step, f[n-1])
+.EE
+When a velocity value does not lie exactly on those points,
+a linear interpolation/extrapolation of the two closest points will be calculated.
+.PP
+There are 3 custom acceleration function, which are used for different movement types:
+.TS
+tab(;) allbox;
+l l l.
+Movement type; Uses; supported by
+Fallback; Catch-all default movement type; All devices
+Motion; Used for pointer motion; All devices
+Scroll; Used for scroll movement; Mouse, Touchpad
+.TE
+.PP
+See libinput library documentation of more details:
+https://wayland.freedesktop.org/libinput/doc/latest/pointer-acceleration.html#the-custom-acceleration-profile
+
 .SH BUGS
 This driver does not work with \fBOption \*qDevice\*q\fR set to an event
 node in \fI/dev/input/by-id\fR and \fI/dev/input/by-path\fR. This can be
 usually be worked by using \fBSection \*qInputClass\*q\fR with an
-appropriate \fBMatch*\fR statement in the __xconfigfile__(__filemansuffix__).
+appropriate \fBMatch*\fR statement in the xorg.conf(5).
 
 .SH AUTHORS
 Peter Hutterer
 .SH "SEE ALSO"
-__xservername__(__appmansuffix__), __xconfigfile__(__filemansuffix__), Xserver(__appmansuffix__), X(__miscmansuffix__)
+Xorg(1), xorg.conf(5), Xserver(1), X(7)

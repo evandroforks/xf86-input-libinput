@@ -1,29 +1,29 @@
 /*
+ * SPDX-License-Identifier: MIT
+ *
  * Copyright © 2013-2017 Red Hat, Inc.
  *
- * Permission to use, copy, modify, distribute, and sell this software
- * and its documentation for any purpose is hereby granted without
- * fee, provided that the above copyright notice appear in all copies
- * and that both that copyright notice and this permission notice
- * appear in supporting documentation, and that the name of Red Hat
- * not be used in advertising or publicity pertaining to distribution
- * of the software without specific, written prior permission.  Red
- * Hat makes no representations about the suitability of this software
- * for any purpose.  It is provided "as is" without express or implied
- * warranty.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- * THE AUTHORS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
- * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
- * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
- * OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
- * NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * The above copyright notice and this permission notice (including the next
+ * paragraph) shall be included in all copies or substantial portions of the
+ * Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
  */
 
-#ifdef HAVE_CONFIG_H
 #include "config.h"
-#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -45,11 +45,24 @@
 #include "bezier.h"
 #include "draglock.h"
 #include "libinput-properties.h"
+#include "util-strings.h"
 
 #define TOUCHPAD_NUM_AXES 4 /* x, y, hscroll, vscroll */
 #define TABLET_NUM_BUTTONS 7 /* we need scroll buttons */
 #define TOUCH_MAX_SLOTS 15
 #define XORG_KEYCODE_OFFSET 8
+#define SCROLL_INCREMENT 15
+#define TOUCHPAD_SCROLL_DIST_MIN 10 /* in libinput pixels */
+#define TOUCHPAD_SCROLL_DIST_MAX 50 /* in libinput pixels */
+
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+#define CUSTOM_ACCEL_NPOINTS_MIN 2
+#define CUSTOM_ACCEL_NPOINTS_MAX 64
+#define CUSTOM_ACCEL_POINT_MIN 0
+#define CUSTOM_ACCEL_POINT_MAX 10000
+#define CUSTOM_ACCEL_STEP_MIN 0
+#define CUSTOM_ACCEL_STEP_MAX 10000
+#endif
 
 #define streq(a, b) (strcmp(a, b) == 0)
 #define strneq(a, b, n) (strncmp(a, b, n) == 0)
@@ -67,12 +80,21 @@
 #define TABLET_STRIP_AXIS_MAX 4096
 #define TABLET_RING_AXIS_MAX 71
 
-#define CAP_KEYBOARD	0x1
-#define CAP_POINTER	0x2
-#define CAP_TOUCH	0x4
-#define CAP_TABLET	0x8
-#define CAP_TABLET_TOOL	0x10
-#define CAP_TABLET_PAD	0x20
+enum capabilities {
+	CAP_KEYBOARD = 0x1,
+	CAP_POINTER = 0x2,
+	CAP_TOUCH = 0x4,
+	CAP_TABLET = 0x8,
+	CAP_TABLET_TOOL = 0x10,
+	CAP_TABLET_PAD = 0x20,
+	CAP_GESTURE = 0x40,
+};
+
+#if HAVE_INPUTPROTO24
+#if ABI_XINPUT_VERSION >= SET_ABI_VERSION(24, 4)
+#define HAVE_GESTURES
+#endif
+#endif
 
 struct xf86libinput_driver {
 	struct libinput *libinput;
@@ -107,6 +129,14 @@ struct xf86libinput_tablet_tool {
 	struct xorg_list node;
 	struct libinput_tablet_tool *tool;
 };
+
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+struct accel_points {
+	double step;
+	double points[CUSTOM_ACCEL_NPOINTS_MAX];
+	size_t npoints;
+};
+#endif
 
 struct xf86libinput {
 	InputInfoPtr pInfo;
@@ -144,18 +174,30 @@ struct xf86libinput {
 		CARD32 sendevents;
 		CARD32 scroll_button; /* xorg button number */
 		BOOL scroll_buttonlock;
+		uint32_t scroll_pixel_distance;
 		float speed;
 		float matrix[9];
 		enum libinput_config_scroll_method scroll_method;
 		enum libinput_config_click_method click_method;
+#if HAVE_LIBINPUT_CLICKFINGER_BUTTON_MAP
+		enum libinput_config_clickfinger_button_map clickfinger_button_map;
+#endif
 		enum libinput_config_accel_profile accel_profile;
-
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+		struct accel_points accel_points_fallback;
+		struct accel_points accel_points_motion;
+		struct accel_points accel_points_scroll;
+#endif
 		unsigned char btnmap[MAX_BUTTONS + 1];
 
 		BOOL horiz_scrolling_enabled;
+		BOOL hires_scrolling_enabled;
 
 		float rotation_angle;
 		struct bezier_control_point pressurecurve[4];
+		struct range {
+			float min, max;
+		} pressure_range;
 		struct ratio {
 			int x, y;
 		} area;
@@ -220,6 +262,7 @@ btn_linux2xorg(unsigned int b)
 	/* tablet button range */
 	case BTN_STYLUS: button = 2; break;
 	case BTN_STYLUS2: button = 3; break;
+	case BTN_STYLUS3: button = 8; break;
 	default:
 		button = 8 + b - BTN_SIDE;
 		break;
@@ -251,7 +294,7 @@ xf86libinput_is_subdevice(InputInfoPtr pInfo)
 	char *source;
 	BOOL is_subdevice;
 
-	source = xf86SetStrOption(pInfo->options, "_source", "");
+	source = xf86CheckStrOption(pInfo->options, "_source", "");
 	is_subdevice = streq(source, "_driver/libinput");
 	free(source);
 
@@ -418,6 +461,25 @@ xf86libinput_set_pressurecurve(struct xf86libinput *driver_data,
 			    driver_data->pressurecurve.sz);
 }
 
+static inline bool
+xf86libinput_set_pressure_range(struct xf86libinput *driver_data,
+				const struct range *range)
+{
+#if HAVE_LIBINPUT_PRESSURE_RANGE
+	struct libinput_tablet_tool *tool = driver_data->tablet_tool;
+
+	if (!tool)
+		return FALSE;
+
+	return libinput_tablet_tool_config_pressure_range_is_available(tool) &&
+	       libinput_tablet_tool_config_pressure_range_set(tool,
+							      range->min,
+							      range->max) == LIBINPUT_CONFIG_STATUS_SUCCESS;
+#else
+	return FALSE;
+#endif
+}
+
 static inline void
 xf86libinput_set_area_ratio(struct xf86libinput *driver_data,
 			    const struct ratio *ratio)
@@ -464,8 +526,10 @@ subdevice_has_capabilities(DeviceIntPtr dev, uint32_t capabilities)
 }
 
 static int
-LibinputSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
-                 BOOL checkonly);
+LibinputSetProperty(DeviceIntPtr dev, Atom atom,
+		    XIPropertyValuePtr val,
+		    BOOL checkonly);
+
 static void
 LibinputInitProperty(DeviceIntPtr dev);
 
@@ -502,11 +566,68 @@ LibinputApplyConfigNaturalScroll(DeviceIntPtr dev,
 			    driver_data->options.natural_scrolling);
 }
 
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+static bool
+LibinputApplyConfigAccelCustom(struct xf86libinput *driver_data,
+			       struct libinput_device *device)
+{
+	bool success = false;
+	struct libinput_config_accel *accel;
+	enum libinput_config_status status;
+
+	accel = libinput_config_accel_create(LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM);
+	if (!accel)
+		goto out;
+
+	/* If the step is 0, the user has not set a custom function,
+	   thus we don't set the points */
+	if (driver_data->options.accel_points_fallback.step > 0 &&
+	    driver_data->options.accel_points_fallback.npoints >= 2) {
+		status = libinput_config_accel_set_points(accel,
+							  LIBINPUT_ACCEL_TYPE_FALLBACK,
+							  driver_data->options.accel_points_fallback.step,
+							  driver_data->options.accel_points_fallback.npoints,
+							  driver_data->options.accel_points_fallback.points);
+		if (status != LIBINPUT_CONFIG_STATUS_SUCCESS)
+			goto out;
+	}
+
+	if (driver_data->options.accel_points_motion.step > 0 &&
+	    driver_data->options.accel_points_motion.npoints >= 2) {
+		status = libinput_config_accel_set_points(accel,
+							  LIBINPUT_ACCEL_TYPE_MOTION,
+							  driver_data->options.accel_points_motion.step,
+							  driver_data->options.accel_points_motion.npoints,
+							  driver_data->options.accel_points_motion.points);
+		if (status != LIBINPUT_CONFIG_STATUS_SUCCESS)
+			goto out;
+	}
+
+	if (driver_data->options.accel_points_scroll.step > 0 &&
+	    driver_data->options.accel_points_scroll.npoints >= 2) {
+		status = libinput_config_accel_set_points(accel,
+							  LIBINPUT_ACCEL_TYPE_SCROLL,
+							  driver_data->options.accel_points_scroll.step,
+							  driver_data->options.accel_points_scroll.npoints,
+							  driver_data->options.accel_points_scroll.points);
+		if (status != LIBINPUT_CONFIG_STATUS_SUCCESS)
+			goto out;
+	}
+
+	status = libinput_device_config_accel_apply(device, accel);
+	success = status == LIBINPUT_CONFIG_STATUS_SUCCESS;
+out:
+	libinput_config_accel_destroy(accel);
+	return success;
+}
+#endif
+
 static void
 LibinputApplyConfigAccel(DeviceIntPtr dev,
 			 struct xf86libinput *driver_data,
 			 struct libinput_device *device)
 {
+	bool success = false;
 	InputInfoPtr pInfo = dev->public.devicePrivate;
 
 	if (!subdevice_has_capabilities(dev, CAP_POINTER))
@@ -515,15 +636,31 @@ LibinputApplyConfigAccel(DeviceIntPtr dev,
 	if (libinput_device_config_accel_is_available(device) &&
 	    libinput_device_config_accel_set_speed(device,
 						   driver_data->options.speed) != LIBINPUT_CONFIG_STATUS_SUCCESS)
-			xf86IDrvMsg(pInfo, X_ERROR,
-				    "Failed to set speed %.2f\n",
-				    driver_data->options.speed);
+		xf86IDrvMsg(pInfo, X_ERROR,
+			    "Failed to set speed %.2f\n",
+			    driver_data->options.speed);
 
-	if (libinput_device_config_accel_get_profiles(device) &&
-	    driver_data->options.accel_profile != LIBINPUT_CONFIG_ACCEL_PROFILE_NONE  &&
-	    libinput_device_config_accel_set_profile(device,
-						     driver_data->options.accel_profile) !=
-			    LIBINPUT_CONFIG_STATUS_SUCCESS) {
+	if (!libinput_device_config_accel_get_profiles(device) ||
+	    driver_data->options.accel_profile == LIBINPUT_CONFIG_ACCEL_PROFILE_NONE)
+		return;
+
+	switch (driver_data->options.accel_profile) {
+	case LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT:
+	case LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE:
+		success = libinput_device_config_accel_set_profile(device, driver_data->options.accel_profile) ==
+				LIBINPUT_CONFIG_STATUS_SUCCESS;
+		break;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	case LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM:
+		success = LibinputApplyConfigAccelCustom(driver_data, device);
+		break;
+#endif
+	default:
+		success = false;
+		break;
+	}
+
+	if (!success) {
 		const char *profile;
 
 		switch (driver_data->options.accel_profile) {
@@ -533,6 +670,11 @@ LibinputApplyConfigAccel(DeviceIntPtr dev,
 		case LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT:
 			profile = "flat";
 			break;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+		case LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM:
+			profile = "custom";
+			break;
+#endif
 		default:
 			profile = "unknown";
 			break;
@@ -618,7 +760,7 @@ LibinputApplyConfigLeftHanded(DeviceIntPtr dev,
 {
 	InputInfoPtr pInfo = dev->public.devicePrivate;
 
-	if (!subdevice_has_capabilities(dev, CAP_POINTER|CAP_TABLET))
+	if (!subdevice_has_capabilities(dev, CAP_POINTER|CAP_TABLET|CAP_TABLET_TOOL))
 		return;
 
 	if (libinput_device_config_left_handed_is_available(device) &&
@@ -689,6 +831,7 @@ LibinputApplyConfigClickMethod(DeviceIntPtr dev,
 			       struct libinput_device *device)
 {
 	InputInfoPtr pInfo = dev->public.devicePrivate;
+	uint32_t click_methods = libinput_device_config_click_get_methods(device);
 
 	if (!subdevice_has_capabilities(dev, CAP_POINTER))
 		return;
@@ -709,6 +852,24 @@ LibinputApplyConfigClickMethod(DeviceIntPtr dev,
 			    "Failed to set click method to %s\n",
 			    method);
 	}
+
+#if HAVE_LIBINPUT_CLICKFINGER_BUTTON_MAP
+	if (click_methods & LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER &&
+	    libinput_device_config_click_set_clickfinger_button_map(device,
+								    driver_data->options.clickfinger_button_map) != LIBINPUT_CONFIG_STATUS_SUCCESS) {
+		const char *map;
+
+		switch (driver_data->options.clickfinger_button_map) {
+		case LIBINPUT_CONFIG_CLICKFINGER_MAP_LRM: map = "LRM"; break;
+		case LIBINPUT_CONFIG_CLICKFINGER_MAP_LMR: map = "LMR"; break;
+		default:
+			map = "unknown"; break;
+		}
+		xf86IDrvMsg(pInfo, X_ERROR,
+			    "Failed to set clickfinger button map to %s\n",
+			    map);
+	}
+#endif
 }
 
 static void
@@ -764,6 +925,27 @@ LibinputApplyConfigRotation(DeviceIntPtr dev,
 			    driver_data->options.rotation_angle);
 }
 
+static void
+LibinputApplyConfigPressureRange(DeviceIntPtr dev,
+				 struct xf86libinput *driver_data,
+				 struct libinput_device *device)
+{
+#if HAVE_LIBINPUT_PRESSURE_RANGE
+	InputInfoPtr pInfo = dev->public.devicePrivate;
+	struct libinput_tablet_tool *tool = driver_data->tablet_tool;
+	struct range *range = &driver_data->options.pressure_range;
+
+	if (!subdevice_has_capabilities(dev, CAP_TABLET_TOOL))
+		return;
+
+	if (tool && libinput_tablet_tool_config_pressure_range_is_available(tool) &&
+	    libinput_tablet_tool_config_pressure_range_set(tool, range->min, range->max) != LIBINPUT_CONFIG_STATUS_SUCCESS)
+		xf86IDrvMsg(pInfo, X_ERROR,
+			    "Failed to set PressureRange to %.2f..%.2f\n",
+			    range->min, range->max);
+#endif
+}
+
 static inline void
 LibinputApplyConfig(DeviceIntPtr dev)
 {
@@ -782,6 +964,7 @@ LibinputApplyConfig(DeviceIntPtr dev)
 	LibinputApplyConfigMiddleEmulation(dev, driver_data, device);
 	LibinputApplyConfigDisableWhileTyping(dev, driver_data, device);
 	LibinputApplyConfigRotation(dev, driver_data, device);
+	LibinputApplyConfigPressureRange(dev, driver_data, device);
 }
 
 static int
@@ -983,35 +1166,41 @@ xf86libinput_init_pointer_absolute(InputInfoPtr pInfo)
 
 	return Success;
 }
+
 static void
 xf86libinput_kbd_ctrl(DeviceIntPtr device, KeybdCtrl *ctrl)
 {
-#define CAPSFLAG	1
-#define NUMFLAG		2
-#define SCROLLFLAG	4
+#define CAPSFLAG    1
+#define NUMFLAG     2
+#define SCROLLFLAG  4
+#define COMPOSEFLAG 8
+#define KANAFLAG    16
+	static struct { int xbit, code; } bits[] = {
+		{ CAPSFLAG,	LIBINPUT_LED_CAPS_LOCK },
+		{ NUMFLAG,	LIBINPUT_LED_NUM_LOCK },
+		{ SCROLLFLAG,	LIBINPUT_LED_SCROLL_LOCK },
+#ifdef HAVE_LIBINPUT_COMPOSE_AND_KANA
+		{ COMPOSEFLAG,	LIBINPUT_LED_COMPOSE },
+		{ KANAFLAG,	LIBINPUT_LED_KANA },
+#endif
+		{ 0, 0 },
+	};
+	int i = 0;
+	enum libinput_led leds = 0;
+	InputInfoPtr pInfo = device->public.devicePrivate;
+	struct xf86libinput *driver_data = pInfo->private;
+	struct libinput_device *ldevice = driver_data->shared_device->device;
 
-    static struct { int xbit, code; } bits[] = {
-        { CAPSFLAG,	LIBINPUT_LED_CAPS_LOCK },
-        { NUMFLAG,	LIBINPUT_LED_NUM_LOCK },
-        { SCROLLFLAG,	LIBINPUT_LED_SCROLL_LOCK },
-	{ 0, 0 },
-    };
-    int i = 0;
-    enum libinput_led leds = 0;
-    InputInfoPtr pInfo = device->public.devicePrivate;
-    struct xf86libinput *driver_data = pInfo->private;
-    struct libinput_device *ldevice = driver_data->shared_device->device;
+	if (!device->enabled)
+		return;
 
-    if (!device->enabled)
-	    return;
+	while (bits[i].xbit) {
+		if (ctrl->leds & bits[i].xbit)
+			leds |= bits[i].code;
+		i++;
+	}
 
-    while (bits[i].xbit) {
-	    if (ctrl->leds & bits[i].xbit)
-		    leds |= bits[i].code;
-	    i++;
-    }
-
-    libinput_device_led_update(ldevice, leds);
+	libinput_device_led_update(ldevice, leds);
 }
 
 static void
@@ -1052,13 +1241,11 @@ xf86libinput_init_touch(InputInfoPtr pInfo)
 	struct xf86libinput *driver_data = pInfo->private;
 	struct libinput_device *device = driver_data->shared_device->device;
 	int min, max, res;
-	unsigned char btnmap[MAX_BUTTONS + 1];
 	Atom btnlabels[MAX_BUTTONS];
 	Atom axislabels[TOUCHPAD_NUM_AXES];
 	int nbuttons = 7;
 	int ntouches = TOUCH_MAX_SLOTS;
 
-	init_button_map(btnmap, ARRAY_SIZE(btnmap));
 	init_button_labels(btnlabels, ARRAY_SIZE(btnlabels));
 	init_axis_labels(axislabels, ARRAY_SIZE(axislabels));
 
@@ -1085,8 +1272,17 @@ xf86libinput_init_touch(InputInfoPtr pInfo)
 	if (ntouches == 0) /* unknown -  mtdev */
 		ntouches = TOUCH_MAX_SLOTS;
 	InitTouchClassDeviceStruct(dev, ntouches, XIDirectTouch, 2);
-
 }
+
+#ifdef HAVE_GESTURES
+static void
+xf86libinput_init_gesture(InputInfoPtr pInfo)
+{
+	DeviceIntPtr dev = pInfo->dev;
+	int ntouches = TOUCH_MAX_SLOTS;
+	InitGestureClassDeviceStruct(dev, ntouches);
+}
+#endif
 
 static int
 xf86libinput_init_tablet_pen_or_eraser(InputInfoPtr pInfo,
@@ -1193,17 +1389,17 @@ xf86libinput_init_tablet(InputInfoPtr pInfo)
 	struct xf86libinput *driver_data = pInfo->private;
 	struct libinput_tablet_tool *tool;
 	int min, max, res;
-	unsigned char btnmap[TABLET_NUM_BUTTONS];
 	Atom btnlabels[TABLET_NUM_BUTTONS] = {0};
 	Atom axislabels[TOUCHPAD_NUM_AXES] = {0};
 	int nbuttons = TABLET_NUM_BUTTONS;
 	int naxes = 2;
 
-	BUG_RETURN(driver_data->tablet_tool == NULL);
+	if (driver_data->tablet_tool == NULL) {
+		xf86IDrvMsg(pInfo, X_WARNING, "BUG: tablet_tool is NULL\n");
+		return;
+	}
 
 	tool = driver_data->tablet_tool;
-
-	init_button_map(btnmap, ARRAY_SIZE(btnmap));
 
 	if (libinput_tablet_tool_has_pressure(tool))
 		naxes++;
@@ -1260,14 +1456,12 @@ xf86libinput_init_tablet_pad(InputInfoPtr pInfo)
 	struct xf86libinput *driver_data = pInfo->private;
 	struct libinput_device *device = driver_data->shared_device->device;
 	int min, max, res;
-	unsigned char btnmap[MAX_BUTTONS];
 	Atom btnlabels[MAX_BUTTONS] = {0};
 	Atom axislabels[TOUCHPAD_NUM_AXES] = {0};
 	int nbuttons;
 	int naxes = 7;
 
 	nbuttons = libinput_device_tablet_pad_get_num_buttons(device) + 4;
-	init_button_map(btnmap, nbuttons);
 
 	InitPointerDeviceStruct((DevicePtr)dev,
 				driver_data->options.btnmap,
@@ -1321,7 +1515,10 @@ xf86libinput_init(DeviceIntPtr dev)
 	struct xf86libinput_device *shared_device = driver_data->shared_device;
 	struct libinput_device *device = shared_device->device;
 
-	BUG_RETURN_VAL(device == NULL, !Success);
+	if (device == NULL) {
+		xf86IDrvMsg(pInfo, X_WARNING, "BUG: xf86libinput_init() device is NULL\n");
+		return !Success;
+	}
 
 	dev->public.on = FALSE;
 
@@ -1336,6 +1533,10 @@ xf86libinput_init(DeviceIntPtr dev)
 	}
 	if (driver_data->capabilities & CAP_TOUCH)
 		xf86libinput_init_touch(pInfo);
+#ifdef HAVE_GESTURES
+	if (driver_data->capabilities & CAP_GESTURE)
+		xf86libinput_init_gesture(pInfo);
+#endif
 	if (driver_data->capabilities & CAP_TABLET_TOOL)
 		xf86libinput_init_tablet(pInfo);
 	if (driver_data->capabilities & CAP_TABLET_PAD)
@@ -1379,12 +1580,13 @@ swap_registered_device(InputInfoPtr pInfo)
 		return;
 
 	next = xf86FirstLocalDevice();
-	while (next == pInfo || !is_libinput_device(next))
+	while (next && (next == pInfo || !is_libinput_device(next)))
 		next = next->next;
 
 	input_lock();
 	xf86RemoveEnabledDevice(pInfo);
-	xf86AddEnabledDevice(next);
+	if (next)
+		xf86AddEnabledDevice(next);
 	driver_context.registered_InputInfoPtr = next;
 	input_unlock();
 }
@@ -1485,8 +1687,8 @@ xf86libinput_handle_absmotion(InputInfoPtr pInfo, struct libinput_event_pointer 
 	if ((driver_data->capabilities & CAP_POINTER) == 0)
 		return;
 
-	x = libinput_event_pointer_get_absolute_x_transformed(event, TOUCH_AXIS_MAX);
-	y = libinput_event_pointer_get_absolute_y_transformed(event, TOUCH_AXIS_MAX);
+	x = libinput_event_pointer_get_absolute_x_transformed(event, TOUCH_AXIS_MAX + 1);
+	y = libinput_event_pointer_get_absolute_y_transformed(event, TOUCH_AXIS_MAX + 1);
 
 	valuator_mask_zero(mask);
 	valuator_mask_set_double(mask, 0, x);
@@ -1527,6 +1729,14 @@ xf86libinput_handle_key(InputInfoPtr pInfo, struct libinput_event_keyboard *even
 	if ((driver_data->capabilities & CAP_KEYBOARD) == 0)
 		return;
 
+	/* keycodes > 256 that have a historical mapping in xkeyboard-config */
+	switch (key) {
+	case KEY_TOUCHPAD_TOGGLE: key = KEY_F21; break;
+	case KEY_TOUCHPAD_ON:     key = KEY_F22; break;
+	case KEY_TOUCHPAD_OFF:    key = KEY_F23; break;
+	case KEY_MICMUTE:         key = KEY_F20; break;
+	}
+
 	key += XORG_KEYCODE_OFFSET;
 
 	is_press = (libinput_event_keyboard_get_key_state(event) == LIBINPUT_KEY_STATE_PRESSED);
@@ -1548,9 +1758,9 @@ xf86libinput_handle_key(InputInfoPtr pInfo, struct libinput_event_keyboard *even
  * so the use-case above shouldn't matter anymore.
  */
 static inline double
-get_wheel_scroll_value(struct xf86libinput *driver_data,
-		       struct libinput_event_pointer *event,
-		       enum libinput_pointer_axis axis)
+guess_wheel_scroll_value(struct xf86libinput *driver_data,
+			 struct libinput_event_pointer *event,
+			 enum libinput_pointer_axis axis)
 {
 	struct scroll_axis *s;
 	double f;
@@ -1610,57 +1820,124 @@ out:
 	return s->dist/s->fraction * discrete;
 }
 
+#if HAVE_LIBINPUT_AXIS_VALUE_V120
+static inline double
+get_wheel_120_value(struct xf86libinput *driver_data,
+		    struct libinput_event_pointer *event,
+		    enum libinput_pointer_axis axis)
+{
+	struct scroll_axis *s;
+	double angle;
+
+	switch (axis) {
+	case LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL:
+		s = &driver_data->scroll.h;
+		break;
+	case LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL:
+		s = &driver_data->scroll.v;
+		break;
+	default:
+		return 0.0;
+	}
+
+	angle = libinput_event_pointer_get_scroll_value_v120(event, axis);
+	return s->dist * angle/120;
+}
+#endif
+
+static inline double
+get_wheel_scroll_value(struct xf86libinput *driver_data,
+		       struct libinput_event_pointer *event,
+		       enum libinput_pointer_axis axis)
+{
+#if HAVE_LIBINPUT_AXIS_VALUE_V120
+	if (driver_data->options.hires_scrolling_enabled)
+		return get_wheel_120_value(driver_data, event, axis);
+#endif
+	return guess_wheel_scroll_value(driver_data, event, axis);
+}
+
+static inline double
+get_finger_or_continuous_scroll_value(struct xf86libinput *driver_data,
+				      struct libinput_event_pointer *event,
+				      enum libinput_pointer_axis axis)
+{
+#if HAVE_LIBINPUT_AXIS_VALUE_V120
+	if (driver_data->options.hires_scrolling_enabled)
+		return libinput_event_pointer_get_scroll_value(event, axis);
+#endif
+	return libinput_event_pointer_get_axis_value(event, axis);
+}
+
 static inline bool
 calculate_axis_value(struct xf86libinput *driver_data,
 		     enum libinput_pointer_axis axis,
 		     struct libinput_event_pointer *event,
+		     enum libinput_pointer_axis_source source,
 		     double *value_out)
 {
-	enum libinput_pointer_axis_source source;
 	double value;
 
 	if (!libinput_event_pointer_has_axis(event, axis))
 		return false;
 
-	source = libinput_event_pointer_get_axis_source(event);
+	/* Event may be LIBINPUT_POINTER_AXIS or
+	 * LIBINPUT_EVENT_POINTER_SCROLL_{WHEEL|FINGER|CONTINUOUS}, depending
+	 * on the libinput version.
+	 *
+	 * libinput guarantees the axis source is set for the second set of
+	 * events too but we can switch to the event type once we ditch
+	 * libinput < 1.19 support.
+	 */
 	if (source == LIBINPUT_POINTER_AXIS_SOURCE_WHEEL) {
 		value = get_wheel_scroll_value(driver_data, event, axis);
 	} else {
-		value = libinput_event_pointer_get_axis_value(event, axis);
+		double dist = driver_data->options.scroll_pixel_distance;
+		assert(dist != 0.0);
+
+		value = get_finger_or_continuous_scroll_value(driver_data,
+							      event,
+							      axis);
+
+		/* We need to scale this value into our scroll increment range
+		 * because that one is constant for the lifetime of the
+		 * device. The user may change the ScrollPixelDistance
+		 * though, so where we have a dist of 10 but an increment of
+		 * 15, we need to scale from 0..10 into 0..15.
+		 *
+		 * We now switched to vdist of 120, so make this
+		 * proportionate - 120/15 is 8.
+		 */
+		value = value/dist * SCROLL_INCREMENT * 8;
 	}
 
+	value *= 1.5;
 	*value_out = value;
 
 	return true;
 }
 
 static void
-xf86libinput_handle_axis(InputInfoPtr pInfo, struct libinput_event_pointer *event)
+xf86libinput_handle_axis(InputInfoPtr pInfo,
+			 struct libinput_event *e,
+			 enum libinput_pointer_axis_source source)
 {
+	struct libinput_event_pointer *event;
 	DeviceIntPtr dev = pInfo->dev;
 	struct xf86libinput *driver_data = pInfo->private;
 	ValuatorMask *mask = driver_data->valuators;
 	double value;
-	enum libinput_pointer_axis_source source;
 
 	if ((driver_data->capabilities & CAP_POINTER) == 0)
 		return;
 
 	valuator_mask_zero(mask);
 
-	source = libinput_event_pointer_get_axis_source(event);
-	switch(source) {
-		case LIBINPUT_POINTER_AXIS_SOURCE_FINGER:
-		case LIBINPUT_POINTER_AXIS_SOURCE_WHEEL:
-		case LIBINPUT_POINTER_AXIS_SOURCE_CONTINUOUS:
-			break;
-		default:
-			return;
-	}
-
+	event = libinput_event_get_pointer_event(e);
 	if (calculate_axis_value(driver_data,
 				 LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL,
 				 event,
+				 source,
 				 &value))
 		valuator_mask_set_double(mask, 3, value);
 
@@ -1670,8 +1947,14 @@ xf86libinput_handle_axis(InputInfoPtr pInfo, struct libinput_event_pointer *even
 	if (calculate_axis_value(driver_data,
 				 LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL,
 				 event,
+				 source,
 				 &value))
 		valuator_mask_set_double(mask, 2, value);
+
+	if (source == LIBINPUT_POINTER_AXIS_SOURCE_WHEEL &&
+	    !valuator_mask_isset(mask, 2) &&
+	    !valuator_mask_isset(mask, 3))
+		return;
 
 out:
 	xf86PostMotionEventM(dev, Relative, mask);
@@ -1705,6 +1988,7 @@ xf86libinput_handle_touch(InputInfoPtr pInfo,
 			touchids[slot] = next_touchid++;
 			break;
 		case LIBINPUT_EVENT_TOUCH_UP:
+		case LIBINPUT_EVENT_TOUCH_CANCEL:
 			type = XI_TouchEnd;
 			break;
 		case LIBINPUT_EVENT_TOUCH_MOTION:
@@ -1712,11 +1996,11 @@ xf86libinput_handle_touch(InputInfoPtr pInfo,
 			break;
 		default:
 			return;
-	};
+	}
 
 	valuator_mask_zero(m);
 
-	if (event_type != LIBINPUT_EVENT_TOUCH_UP) {
+	if (type != XI_TouchEnd) {
 		val = libinput_event_touch_get_x_transformed(event, TOUCH_AXIS_MAX);
 		valuator_mask_set_double(m, 0, val);
 
@@ -1726,6 +2010,86 @@ xf86libinput_handle_touch(InputInfoPtr pInfo,
 
 	xf86PostTouchEvent(dev, touchids[slot], type, 0, m);
 }
+
+#ifdef HAVE_GESTURES
+static void
+xf86libinput_handle_gesture_swipe(InputInfoPtr pInfo,
+				  struct libinput_event_gesture *event,
+				  enum libinput_event_type event_type)
+{
+	DeviceIntPtr dev = pInfo->dev;
+	struct xf86libinput *driver_data = pInfo->private;
+	int type;
+	uint32_t flags = 0;
+
+	if ((driver_data->capabilities & CAP_GESTURE) == 0)
+		return;
+
+	switch (event_type) {
+		case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+			type = XI_GestureSwipeBegin;
+			break;
+		case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
+			type = XI_GestureSwipeUpdate;
+			break;
+		case LIBINPUT_EVENT_GESTURE_SWIPE_END:
+			type = XI_GestureSwipeEnd;
+			if (libinput_event_gesture_get_cancelled(event))
+			    flags |= XIGestureSwipeEventCancelled;
+			break;
+		default:
+			return;
+	}
+
+	xf86PostGestureSwipeEvent(dev, type,
+				  libinput_event_gesture_get_finger_count(event),
+				  flags,
+				  libinput_event_gesture_get_dx(event),
+				  libinput_event_gesture_get_dy(event),
+				  libinput_event_gesture_get_dx_unaccelerated(event),
+				  libinput_event_gesture_get_dy_unaccelerated(event));
+}
+
+static void
+xf86libinput_handle_gesture_pinch(InputInfoPtr pInfo,
+				  struct libinput_event_gesture *event,
+				  enum libinput_event_type event_type)
+{
+	DeviceIntPtr dev = pInfo->dev;
+	struct xf86libinput *driver_data = pInfo->private;
+	int type;
+	uint32_t flags = 0;
+
+	if ((driver_data->capabilities & CAP_GESTURE) == 0)
+		return;
+
+	switch (event_type) {
+		case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
+			type = XI_GesturePinchBegin;
+			break;
+		case LIBINPUT_EVENT_GESTURE_PINCH_UPDATE:
+			type = XI_GesturePinchUpdate;
+			break;
+		case LIBINPUT_EVENT_GESTURE_PINCH_END:
+			type = XI_GesturePinchEnd;
+			if (libinput_event_gesture_get_cancelled(event))
+			    flags |= XIGesturePinchEventCancelled;
+			break;
+		default:
+			return;
+	}
+
+	xf86PostGesturePinchEvent(dev, type,
+				  libinput_event_gesture_get_finger_count(event),
+				  flags,
+				  libinput_event_gesture_get_dx(event),
+				  libinput_event_gesture_get_dy(event),
+				  libinput_event_gesture_get_dx_unaccelerated(event),
+				  libinput_event_gesture_get_dy_unaccelerated(event),
+				  libinput_event_gesture_get_scale(event),
+				  libinput_event_gesture_get_angle_delta(event));
+}
+#endif
 
 static InputInfoPtr
 xf86libinput_pick_device(struct xf86libinput_device *shared_device,
@@ -2135,7 +2499,10 @@ xf86libinput_handle_tablet_proximity(InputInfoPtr pInfo,
 	if (xf86libinput_tool_queue_event(event))
 		return EVENT_QUEUED;
 
-	BUG_RETURN_VAL(pDev == NULL, EVENT_HANDLED);
+	if (pDev == NULL) {
+		xf86IDrvMsg(pInfo, X_WARNING, "BUG: xf86libinput_handle_tablet_proximity() pDev is NULL\n");
+		return EVENT_HANDLED;
+	}
 
 	x = libinput_event_tablet_tool_get_x_transformed(event, TABLET_AXIS_MAX);
 	y = libinput_event_tablet_tool_get_y_transformed(event, TABLET_AXIS_MAX);
@@ -2236,6 +2603,7 @@ xf86libinput_handle_event(struct libinput_event *event)
 	struct libinput_device *device;
 	enum libinput_event_type type;
 	InputInfoPtr pInfo;
+	struct xf86libinput *driver_data;
 	enum event_handling event_handling = EVENT_HANDLED;
 
 	type = libinput_event_get_type(event);
@@ -2245,6 +2613,8 @@ xf86libinput_handle_event(struct libinput_event *event)
 
 	if (!pInfo || !pInfo->dev->public.on)
 		goto out;
+
+	driver_data = pInfo->private;
 
 	switch (type) {
 		case LIBINPUT_EVENT_NONE:
@@ -2269,9 +2639,42 @@ xf86libinput_handle_event(struct libinput_event *event)
 						libinput_event_get_keyboard_event(event));
 			break;
 		case LIBINPUT_EVENT_POINTER_AXIS:
+#if HAVE_LIBINPUT_AXIS_VALUE_V120
+			/* ignore POINTER_AXIS where we have libinput 1.19 and
+			   higher and high-resolution scroll is enabled */
+			if (driver_data->options.hires_scrolling_enabled)
+				break;
+#endif
+
 			xf86libinput_handle_axis(pInfo,
-						 libinput_event_get_pointer_event(event));
+						 event,
+						 libinput_event_pointer_get_axis_source(
+							libinput_event_get_pointer_event(event)
+						 ));
 			break;
+#if HAVE_LIBINPUT_AXIS_VALUE_V120
+		case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+			if (driver_data->options.hires_scrolling_enabled) {
+				xf86libinput_handle_axis(pInfo,
+							 event,
+							 LIBINPUT_POINTER_AXIS_SOURCE_WHEEL);
+			}
+			break;
+		case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+			if (driver_data->options.hires_scrolling_enabled) {
+				xf86libinput_handle_axis(pInfo,
+							 event,
+							 LIBINPUT_POINTER_AXIS_SOURCE_FINGER);
+			}
+			break;
+		case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+			if (driver_data->options.hires_scrolling_enabled) {
+				xf86libinput_handle_axis(pInfo,
+							 event,
+							 LIBINPUT_POINTER_AXIS_SOURCE_CONTINUOUS);
+			}
+			break;
+#endif
 		case LIBINPUT_EVENT_TOUCH_FRAME:
 			break;
 		case LIBINPUT_EVENT_TOUCH_UP:
@@ -2285,9 +2688,20 @@ xf86libinput_handle_event(struct libinput_event *event)
 		case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
 		case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
 		case LIBINPUT_EVENT_GESTURE_SWIPE_END:
+#ifdef HAVE_GESTURES
+			xf86libinput_handle_gesture_swipe(pInfo,
+							  libinput_event_get_gesture_event(event),
+							  type);
+#endif
+			break;
 		case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
 		case LIBINPUT_EVENT_GESTURE_PINCH_UPDATE:
 		case LIBINPUT_EVENT_GESTURE_PINCH_END:
+#ifdef HAVE_GESTURES
+			xf86libinput_handle_gesture_pinch(pInfo,
+							  libinput_event_get_gesture_event(event),
+							  type);
+#endif
 			break;
 		case LIBINPUT_EVENT_TABLET_TOOL_AXIS:
 			event_handling = xf86libinput_handle_tablet_axis(pInfo,
@@ -2332,7 +2746,7 @@ xf86libinput_read_input(InputInfoPtr pInfo)
 	int rc;
 	struct libinput_event *event;
 
-        rc = libinput_dispatch(libinput);
+	rc = libinput_dispatch(libinput);
 	if (rc == -EAGAIN)
 		return;
 
@@ -2560,6 +2974,46 @@ xf86libinput_parse_tap_buttonmap_option(InputInfoPtr pInfo,
 	return map;
 }
 
+#if HAVE_LIBINPUT_CLICKFINGER_BUTTON_MAP
+static inline enum libinput_config_clickfinger_button_map
+xf86libinput_parse_clickfinger_map_option(InputInfoPtr pInfo,
+					  struct libinput_device *device)
+{
+	uint32_t click_methods = libinput_device_config_click_get_methods(device);
+	enum libinput_config_clickfinger_button_map map;
+	char *str;
+
+	map = libinput_device_config_click_get_clickfinger_button_map(device);
+	if ((click_methods & LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER) == 0)
+		return map;
+
+	str = xf86SetStrOption(pInfo->options,
+			       "ClickfingerButtonMap",
+			       NULL);
+	if (str) {
+		if (streq(str, "lmr"))
+			map = LIBINPUT_CONFIG_CLICKFINGER_MAP_LMR;
+		else if (streq(str, "lrm"))
+			map = LIBINPUT_CONFIG_CLICKFINGER_MAP_LRM;
+		else
+			xf86IDrvMsg(pInfo, X_ERROR,
+				    "Invalid ClickfingerButtonMap: %s\n",
+				    str);
+		free(str);
+	}
+
+	if (libinput_device_config_click_set_clickfinger_button_map(device, map) !=
+	    LIBINPUT_CONFIG_STATUS_SUCCESS) {
+		xf86IDrvMsg(pInfo, X_ERROR,
+			    "Failed to set Clickfinger Button Map to %d\n",
+			    map);
+		map = libinput_device_config_click_get_clickfinger_button_map(device);
+	}
+
+	return map;
+}
+#endif
+
 static inline double
 xf86libinput_parse_accel_option(InputInfoPtr pInfo,
 				struct libinput_device *device)
@@ -2597,10 +3051,14 @@ xf86libinput_parse_accel_profile_option(InputInfoPtr pInfo,
 	str = xf86SetStrOption(pInfo->options, "AccelProfile", NULL);
 	if (!str)
 		profile = libinput_device_config_accel_get_profile(device);
-	else if (strncasecmp(str, "adaptive", 9) == 0)
+	else if (strcasecmp(str, "adaptive") == 0)
 		profile = LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE;
-	else if (strncasecmp(str, "flat", 4) == 0)
+	else if (strcasecmp(str, "flat") == 0)
 		profile = LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	else if (strcasecmp(str, "custom") == 0)
+		profile = LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM;
+#endif
 	else {
 		xf86IDrvMsg(pInfo, X_ERROR,
 			    "Unknown accel profile '%s'. Using default.\n",
@@ -2612,6 +3070,119 @@ xf86libinput_parse_accel_profile_option(InputInfoPtr pInfo,
 
 	return profile;
 }
+
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+static inline struct accel_points
+xf86libinput_parse_accel_points_option(InputInfoPtr pInfo, struct libinput_device *device, const char *name)
+{
+	struct accel_points accel_points = {0};
+	char *str = NULL;
+	double *points = NULL;
+	size_t npoints = 0;
+
+	if ((libinput_device_config_accel_get_profiles(device) & LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM) == 0)
+		goto out;
+
+	str = xf86SetStrOption(pInfo->options, name, NULL);
+	if (!str)
+		goto out;
+
+	points = double_array_from_string(str, " ", &npoints);
+	if (!points) {
+		xf86IDrvMsg(pInfo, X_ERROR, "Failed to parse AccelPoints, ignoring points.\n");
+		goto out;
+	}
+
+	if (npoints < CUSTOM_ACCEL_NPOINTS_MIN) {
+		xf86IDrvMsg(pInfo, X_ERROR, "At least %d AccelPoints are required, ignoring points.\n",
+			    CUSTOM_ACCEL_NPOINTS_MIN);
+		goto out;
+	}
+
+	if (npoints > CUSTOM_ACCEL_NPOINTS_MAX) {
+		xf86IDrvMsg(pInfo, X_WARNING, "Excessive number of AccelPoints, clipping to first %d points.\n",
+			    CUSTOM_ACCEL_NPOINTS_MAX);
+		npoints = CUSTOM_ACCEL_NPOINTS_MAX;
+	}
+
+	for (size_t idx = 0; idx < npoints; idx++) {
+		if (points[idx] < CUSTOM_ACCEL_POINT_MIN || points[idx] > CUSTOM_ACCEL_POINT_MAX) {
+			xf86IDrvMsg(pInfo, X_ERROR, "AccelPoints are not in the allowed range between %d and %d, ignoring points.\n",
+				    CUSTOM_ACCEL_POINT_MIN,
+				    CUSTOM_ACCEL_POINT_MAX);
+			goto out;
+		}
+	}
+
+	memcpy(accel_points.points, points, npoints * sizeof(*points));
+	accel_points.npoints = npoints;
+
+out:
+	free(str);
+	free(points);
+	return accel_points;
+}
+
+static inline struct accel_points
+xf86libinput_parse_accel_points_fallback_option(InputInfoPtr pInfo, struct libinput_device *device)
+{
+	return xf86libinput_parse_accel_points_option(pInfo, device, "AccelPointsFallback");
+}
+
+static inline struct accel_points
+xf86libinput_parse_accel_points_motion_option(InputInfoPtr pInfo, struct libinput_device *device)
+{
+	return xf86libinput_parse_accel_points_option(pInfo, device, "AccelPointsMotion");
+}
+
+static inline struct accel_points
+xf86libinput_parse_accel_points_scroll_option(InputInfoPtr pInfo, struct libinput_device *device)
+{
+	return xf86libinput_parse_accel_points_option(pInfo, device, "AccelPointsScroll");
+}
+
+
+static inline double
+xf86libinput_parse_accel_step_option(InputInfoPtr pInfo, struct libinput_device *device, const char *name)
+{
+	double step = 0.0;
+	double parsed_step;
+
+	if ((libinput_device_config_accel_get_profiles(device) & LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM) == 0)
+		return step;
+
+	parsed_step = xf86SetRealOption(pInfo->options, name, 0.0);
+
+	if (parsed_step < CUSTOM_ACCEL_STEP_MIN || parsed_step > CUSTOM_ACCEL_STEP_MAX) {
+		xf86IDrvMsg(pInfo, X_ERROR, "Invalid step value, ignoring step.\n");
+		return step;
+	}
+
+	if (parsed_step == 0)
+		xf86IDrvMsg(pInfo, X_INFO, "Step value 0 was provided, libinput Fallback acceleration function is used.\n");
+
+	step = parsed_step;
+	return step;
+}
+
+static inline double
+xf86libinput_parse_accel_step_fallback_option(InputInfoPtr pInfo, struct libinput_device *device)
+{
+	return xf86libinput_parse_accel_step_option(pInfo, device, "AccelStepFallback");
+}
+
+static inline double
+xf86libinput_parse_accel_step_motion_option(InputInfoPtr pInfo, struct libinput_device *device)
+{
+	return xf86libinput_parse_accel_step_option(pInfo, device, "AccelStepMotion");
+}
+
+static inline double
+xf86libinput_parse_accel_step_scroll_option(InputInfoPtr pInfo, struct libinput_device *device)
+{
+	return xf86libinput_parse_accel_step_option(pInfo, device, "AccelStepScroll");
+}
+#endif
 
 static inline BOOL
 xf86libinput_parse_natscroll_option(InputInfoPtr pInfo,
@@ -2830,6 +3401,39 @@ xf86libinput_parse_scrollbuttonlock_option(InputInfoPtr pInfo,
 	return buttonlock;
 }
 
+static inline bool
+xf86libinput_want_scroll_distance_option(struct libinput_device *device)
+{
+	uint32_t methods =
+	    LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN |
+	    LIBINPUT_CONFIG_SCROLL_2FG |
+	    LIBINPUT_CONFIG_SCROLL_EDGE;
+
+	if ((libinput_device_config_scroll_get_methods(device) & methods) == 0)
+		return false;
+
+	return true;
+}
+
+static inline uint32_t
+xf86libinput_parse_scroll_pixel_distance_option(InputInfoPtr pInfo,
+						struct libinput_device *device)
+{
+	uint32_t dflt = SCROLL_INCREMENT;
+	uint32_t dist;
+
+	if (!xf86libinput_want_scroll_distance_option(device))
+		return dflt;
+
+	dist = xf86SetIntOption(pInfo->options, "ScrollPixelDistance", dflt);
+	if (dist < TOUCHPAD_SCROLL_DIST_MIN || dist > TOUCHPAD_SCROLL_DIST_MAX) {
+		xf86IDrvMsg(pInfo, X_ERROR,
+			    "Invalid ScrollPixelDistance %d\n", dist);
+		dist = dflt;
+	}
+	return dist;
+}
+
 static inline unsigned int
 xf86libinput_parse_clickmethod_option(InputInfoPtr pInfo,
 				      struct libinput_device *device)
@@ -2963,6 +3567,15 @@ xf86libinput_parse_horiz_scroll_option(InputInfoPtr pInfo)
 	return xf86SetBoolOption(pInfo->options, "HorizontalScrolling", TRUE);
 }
 
+static inline BOOL
+xf86libinput_parse_hirescroll_option(InputInfoPtr pInfo,
+				     struct libinput_device *device)
+{
+	return xf86SetBoolOption(pInfo->options,
+				 "HighResolutionWheelScrolling",
+				 TRUE);
+}
+
 static inline double
 xf86libinput_parse_rotation_angle_option(InputInfoPtr pInfo,
 					 struct libinput_device *device)
@@ -3049,6 +3662,46 @@ out:
 	xf86libinput_set_pressurecurve(driver_data, controls);
 }
 
+static void
+xf86libinput_parse_pressure_range_option(InputInfoPtr pInfo,
+					 struct xf86libinput *driver_data,
+					 struct range *range)
+{
+#if HAVE_LIBINPUT_PRESSURE_RANGE
+	struct libinput_tablet_tool *tool = driver_data->tablet_tool;
+	float min, max;
+	char *str;
+	int rc;
+
+	range->min = 0.0;
+	range->max = 1.0;
+
+	if ((driver_data->capabilities & CAP_TABLET_TOOL) == 0)
+		return;
+
+	if (!tool || !libinput_tablet_tool_config_pressure_range_is_available(tool))
+		return;
+
+	str = xf86SetStrOption(pInfo->options,
+			       "TabletToolPressureRange",
+			       NULL);
+	if (!str)
+		return;
+
+	rc = sscanf(str, "%f %f", &min, &max);
+	if (rc != 2)
+		goto out;
+
+	if (min < 0.0 || max > 1.0 || min >= max)
+		goto out;
+
+	range->min = min;
+	range->max = max;
+out:
+	free(str);
+#endif
+}
+
 static inline bool
 want_area_handling(struct xf86libinput *driver_data)
 {
@@ -3105,13 +3758,25 @@ xf86libinput_parse_options(InputInfoPtr pInfo,
 	options->tap_button_map = xf86libinput_parse_tap_buttonmap_option(pInfo, device);
 	options->speed = xf86libinput_parse_accel_option(pInfo, device);
 	options->accel_profile = xf86libinput_parse_accel_profile_option(pInfo, device);
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	options->accel_points_fallback = xf86libinput_parse_accel_points_fallback_option(pInfo, device);
+	options->accel_points_fallback.step = xf86libinput_parse_accel_step_fallback_option(pInfo, device);
+	options->accel_points_motion = xf86libinput_parse_accel_points_motion_option(pInfo, device);
+	options->accel_points_motion.step = xf86libinput_parse_accel_step_motion_option(pInfo, device);
+	options->accel_points_scroll = xf86libinput_parse_accel_points_scroll_option(pInfo, device);
+	options->accel_points_scroll.step = xf86libinput_parse_accel_step_scroll_option(pInfo, device);
+#endif
 	options->natural_scrolling = xf86libinput_parse_natscroll_option(pInfo, device);
 	options->sendevents = xf86libinput_parse_sendevents_option(pInfo, device);
 	options->left_handed = xf86libinput_parse_lefthanded_option(pInfo, device);
 	options->scroll_method = xf86libinput_parse_scroll_option(pInfo, device);
 	options->scroll_button = xf86libinput_parse_scrollbutton_option(pInfo, device);
 	options->scroll_buttonlock = xf86libinput_parse_scrollbuttonlock_option(pInfo, device);
+	options->scroll_pixel_distance = xf86libinput_parse_scroll_pixel_distance_option(pInfo, device);
 	options->click_method = xf86libinput_parse_clickmethod_option(pInfo, device);
+#if HAVE_LIBINPUT_CLICKFINGER_BUTTON_MAP
+	options->clickfinger_button_map = xf86libinput_parse_clickfinger_map_option(pInfo, device);
+#endif
 	options->middle_emulation = xf86libinput_parse_middleemulation_option(pInfo, device);
 	options->disable_while_typing = xf86libinput_parse_disablewhiletyping_option(pInfo, device);
 	options->rotation_angle = xf86libinput_parse_rotation_angle_option(pInfo, device);
@@ -3124,11 +3789,13 @@ xf86libinput_parse_options(InputInfoPtr pInfo,
 	if (driver_data->capabilities & CAP_POINTER) {
 		xf86libinput_parse_draglock_option(pInfo, driver_data);
 		options->horiz_scrolling_enabled = xf86libinput_parse_horiz_scroll_option(pInfo);
+		options->hires_scrolling_enabled = xf86libinput_parse_hirescroll_option(pInfo, device);
 	}
 
 	xf86libinput_parse_pressurecurve_option(pInfo,
 						driver_data,
 						options->pressurecurve);
+	xf86libinput_parse_pressure_range_option(pInfo, driver_data, &options->pressure_range);
 	xf86libinput_parse_tablet_area_option(pInfo,
 					      driver_data,
 					      &options->area);
@@ -3251,6 +3918,10 @@ xf86libinput_create_subdevice(InputInfoPtr pInfo,
 		options = xf86ReplaceBoolOption(options, "_libinput/cap-pointer", 1);
 	if (capabilities & CAP_TOUCH)
 		options = xf86ReplaceBoolOption(options, "_libinput/cap-touch", 1);
+#ifdef HAVE_GESTURES
+	if (capabilities & CAP_GESTURE)
+		options = xf86ReplaceBoolOption(options, "_libinput/cap-gesture", 1);
+#endif
 	if (capabilities & CAP_TABLET_TOOL)
 		options = xf86ReplaceBoolOption(options, "_libinput/cap-tablet-tool", 1);
 	if (capabilities & CAP_TABLET_PAD)
@@ -3289,6 +3960,10 @@ caps_from_options(InputInfoPtr pInfo)
 		capabilities |= CAP_POINTER;
 	if (xf86CheckBoolOption(pInfo->options, "_libinput/cap-touch", 0))
 		capabilities |= CAP_TOUCH;
+#ifdef HAVE_GESTURES
+	if (xf86CheckBoolOption(pInfo->options, "_libinput/cap-gesture", 0))
+		capabilities |= CAP_GESTURE;
+#endif
 	if (xf86CheckBoolOption(pInfo->options, "_libinput/cap-tablet-tool", 0))
 		capabilities |= CAP_TABLET_TOOL;
 
@@ -3399,7 +4074,7 @@ xf86libinput_pre_init(InputDriverPtr drv,
 			goto fail;
 		}
 
-		/* We ref the device above, then remove it. It get's
+		/* We ref the device above, then remove it. It gets
 		   re-added with the same path in DEVICE_ON, we hope
 		   it doesn't change until then */
 		libinput_device_ref(device);
@@ -3424,8 +4099,8 @@ xf86libinput_pre_init(InputDriverPtr drv,
 	 * affect touchpad scroll speed. For wheels it doesn't matter as
 	 * we're using the discrete value only.
 	 */
-	driver_data->scroll.v.dist = 15;
-	driver_data->scroll.h.dist = 15;
+	driver_data->scroll.v.dist = 120;
+	driver_data->scroll.h.dist = 120;
 
 	if (!is_subdevice) {
 		if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_POINTER))
@@ -3434,6 +4109,10 @@ xf86libinput_pre_init(InputDriverPtr drv,
 			driver_data->capabilities |= CAP_KEYBOARD;
 		if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_TOUCH))
 			driver_data->capabilities |= CAP_TOUCH;
+#ifdef HAVE_GESTURES
+		if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_GESTURE))
+			driver_data->capabilities |= CAP_GESTURE;
+#endif
 		if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_TABLET_TOOL))
 			driver_data->capabilities |= CAP_TABLET;
 		if (libinput_device_has_capability(device, LIBINPUT_DEVICE_CAP_TABLET_PAD))
@@ -3456,7 +4135,7 @@ xf86libinput_pre_init(InputDriverPtr drv,
 	 * this device, create a separate device instead */
 	if (!is_subdevice &&
 	    driver_data->capabilities & CAP_KEYBOARD &&
-	    driver_data->capabilities & (CAP_POINTER|CAP_TOUCH)) {
+	    driver_data->capabilities & (CAP_POINTER|CAP_TOUCH|CAP_GESTURE)) {
 		driver_data->capabilities &= ~CAP_KEYBOARD;
 		xf86libinput_create_subdevice(pInfo,
 					      CAP_KEYBOARD,
@@ -3551,6 +4230,14 @@ static Atom prop_calibration_default;
 static Atom prop_accel;
 static Atom prop_accel_default;
 static Atom prop_accel_profile_enabled;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+static Atom prop_accel_points_fallback;
+static Atom prop_accel_step_fallback;
+static Atom prop_accel_points_motion;
+static Atom prop_accel_step_motion;
+static Atom prop_accel_points_scroll;
+static Atom prop_accel_step_scroll;
+#endif
 static Atom prop_accel_profile_default;
 static Atom prop_accel_profiles_available;
 static Atom prop_natural_scroll;
@@ -3567,9 +4254,13 @@ static Atom prop_scroll_button;
 static Atom prop_scroll_button_default;
 static Atom prop_scroll_buttonlock;
 static Atom prop_scroll_buttonlock_default;
+static Atom prop_scroll_pixel_distance;
+static Atom prop_scroll_pixel_distance_default;
 static Atom prop_click_methods_available;
 static Atom prop_click_method_enabled;
 static Atom prop_click_method_default;
+static Atom prop_clickfinger_buttonmap;
+static Atom prop_clickfinger_buttonmap_default;
 static Atom prop_middle_emulation;
 static Atom prop_middle_emulation_default;
 static Atom prop_disable_while_typing;
@@ -3581,12 +4272,17 @@ static Atom prop_mode_groups_rings;
 static Atom prop_mode_groups_strips;
 static Atom prop_rotation_angle;
 static Atom prop_rotation_angle_default;
+static Atom prop_pressure_range;
+static Atom prop_pressure_range_default;
 
 /* driver properties */
 static Atom prop_draglock;
 static Atom prop_horiz_scroll;
 static Atom prop_pressurecurve;
 static Atom prop_area_ratio;
+static Atom prop_serial;
+static Atom prop_tool_id;
+static Atom prop_hires_scroll;
 
 /* general properties */
 static Atom prop_float;
@@ -3688,7 +4384,7 @@ update_mode_prop(InputInfoPtr pInfo,
 }
 
 static inline BOOL
-xf86libinput_check_device (DeviceIntPtr dev,
+xf86libinput_check_device(DeviceIntPtr dev,
 			   Atom atom)
 {
 	InputInfoPtr pInfo = dev->public.devicePrivate;
@@ -3696,7 +4392,8 @@ xf86libinput_check_device (DeviceIntPtr dev,
 	struct libinput_device *device = driver_data->shared_device->device;
 
 	if (device == NULL) {
-		BUG_WARN(dev->public.on);
+		if (dev->public.on)
+			xf86IDrvMsg(pInfo, X_WARNING, "BUG: xf86libinput_check_device() device is on\n");
 		xf86IDrvMsg(pInfo, X_INFO,
 			    "SetProperty on %u called but device is disabled.\n"
 			    "This driver cannot change properties on a disabled device\n",
@@ -3709,9 +4406,9 @@ xf86libinput_check_device (DeviceIntPtr dev,
 
 static inline int
 LibinputSetPropertyTap(DeviceIntPtr dev,
-                       Atom atom,
-                       XIPropertyValuePtr val,
-                       BOOL checkonly)
+		       Atom atom,
+		       XIPropertyValuePtr val,
+		       BOOL checkonly)
 {
 	InputInfoPtr pInfo = dev->public.devicePrivate;
 	struct xf86libinput *driver_data = pInfo->private;
@@ -3726,7 +4423,7 @@ LibinputSetPropertyTap(DeviceIntPtr dev,
 		if (*data != 0 && *data != 1)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		if (libinput_device_config_tap_get_finger_count(device) == 0)
@@ -3816,9 +4513,13 @@ LibinputSetPropertyTapButtonmap(DeviceIntPtr dev,
 
 	data = (BOOL*)val->data;
 
-	if (checkonly &&
-	    ((data[0] && data[1]) || (!data[0] && !data[1])))
+	if (checkonly) {
+	    if ((data[0] && data[1]) || (!data[0] && !data[1]))
 		return BadValue;
+
+	    if (!xf86libinput_check_device(dev, atom))
+		return BadMatch;
+	}
 
 	if (data[0])
 		map = LIBINPUT_CONFIG_TAP_MAP_LRM;
@@ -3835,8 +4536,8 @@ LibinputSetPropertyTapButtonmap(DeviceIntPtr dev,
 
 static inline int
 LibinputSetPropertyCalibration(DeviceIntPtr dev,
-                               Atom atom,
-                               XIPropertyValuePtr val,
+			       Atom atom,
+			       XIPropertyValuePtr val,
 			       BOOL checkonly)
 {
 	InputInfoPtr pInfo = dev->public.devicePrivate;
@@ -3855,7 +4556,7 @@ LibinputSetPropertyCalibration(DeviceIntPtr dev,
 		    data[8] != 1.0)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		if (!libinput_device_config_calibration_has_matrix(device))
@@ -3889,7 +4590,7 @@ LibinputSetPropertyAccel(DeviceIntPtr dev,
 		if (*data < -1.0 || *data > 1.0)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		if (libinput_device_config_accel_is_available(device) == 0)
@@ -3913,7 +4614,7 @@ LibinputSetPropertyAccelProfile(DeviceIntPtr dev,
 	BOOL* data;
 	uint32_t profiles = 0;
 
-	if (val->format != 8 || val->size != 2 || val->type != XA_INTEGER)
+	if (val->format != 8 || val->size < 2 || val->size > 3 || val->type != XA_INTEGER)
 		return BadMatch;
 
 	data = (BOOL*)val->data;
@@ -3922,6 +4623,10 @@ LibinputSetPropertyAccelProfile(DeviceIntPtr dev,
 		profiles |= LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE;
 	if (data[1])
 		profiles |= LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	if (val->size > 2 && data[2])
+		profiles |= LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM;
+#endif
 
 	if (checkonly) {
 		uint32_t supported;
@@ -3929,7 +4634,7 @@ LibinputSetPropertyAccelProfile(DeviceIntPtr dev,
 		if (__builtin_popcount(profiles) > 1)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		supported = libinput_device_config_accel_get_profiles(device);
@@ -3942,11 +4647,103 @@ LibinputSetPropertyAccelProfile(DeviceIntPtr dev,
 	return Success;
 }
 
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+static inline int
+LibinputSetPropertyAccelPoints(DeviceIntPtr dev,
+			       Atom atom,
+			       XIPropertyValuePtr val,
+			       BOOL checkonly)
+{
+	InputInfoPtr pInfo = dev->public.devicePrivate;
+	struct xf86libinput *driver_data = pInfo->private;
+	struct libinput_device *device = driver_data->shared_device->device;
+	float* data;
+	struct accel_points *accel_points = NULL;
+
+	if (val->format != 32 || val->type != prop_float ||
+	    val->size < CUSTOM_ACCEL_NPOINTS_MIN || val->size > CUSTOM_ACCEL_NPOINTS_MAX)
+		return BadMatch;
+
+	data = (float*)val->data;
+
+	if (checkonly) {
+		uint32_t profiles;
+
+		if (!xf86libinput_check_device(dev, atom))
+			return BadMatch;
+
+		profiles = libinput_device_config_accel_get_profiles(device);
+		if ((profiles & LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM) == 0)
+			return BadValue;
+
+		for (size_t idx = 0; idx < val->size; idx++) {
+			if (data[idx] < CUSTOM_ACCEL_POINT_MIN || data[idx] > CUSTOM_ACCEL_POINT_MAX)
+				return BadValue;
+		}
+	} else {
+		if (atom == prop_accel_points_fallback)
+			accel_points = &driver_data->options.accel_points_fallback;
+		else if (atom == prop_accel_points_motion)
+			accel_points = &driver_data->options.accel_points_motion;
+		else if (atom == prop_accel_points_scroll)
+			accel_points = &driver_data->options.accel_points_scroll;
+		else
+			return BadValue;
+
+		for (size_t idx = 0; idx < val->size; idx++)
+			accel_points->points[idx] = data[idx];
+		accel_points->npoints = val->size;
+	}
+
+	return Success;
+}
+
+static inline int
+LibinputSetPropertyAccelStep(DeviceIntPtr dev,
+			     Atom atom,
+			     XIPropertyValuePtr val,
+			     BOOL checkonly)
+{
+	InputInfoPtr pInfo = dev->public.devicePrivate;
+	struct xf86libinput *driver_data = pInfo->private;
+	struct libinput_device *device = driver_data->shared_device->device;
+	float* data;
+
+	if (val->format != 32 || val->type != prop_float || val->size != 1)
+		return BadMatch;
+
+	data = (float*)val->data;
+
+	if (checkonly) {
+		uint32_t profiles;
+
+		if (!xf86libinput_check_device(dev, atom))
+			return BadMatch;
+
+		profiles = libinput_device_config_accel_get_profiles(device);
+		if ((profiles & LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM) == 0)
+			return BadValue;
+
+		if (*data < CUSTOM_ACCEL_STEP_MIN || *data > CUSTOM_ACCEL_STEP_MAX)
+			return BadValue;
+	} else {
+		if (atom == prop_accel_step_fallback)
+			driver_data->options.accel_points_fallback.step = *data;
+		else if (atom == prop_accel_step_motion)
+			driver_data->options.accel_points_motion.step = *data;
+		else if (atom == prop_accel_step_scroll)
+			driver_data->options.accel_points_scroll.step = *data;
+	}
+
+	return Success;
+}
+#endif
+
 static inline int
 LibinputSetPropertyNaturalScroll(DeviceIntPtr dev,
-                                 Atom atom,
-                                 XIPropertyValuePtr val,
-                                 BOOL checkonly)
+				 Atom atom,
+				 XIPropertyValuePtr val,
+				 BOOL checkonly)
 {
 	InputInfoPtr pInfo = dev->public.devicePrivate;
 	struct xf86libinput *driver_data = pInfo->private;
@@ -3962,7 +4759,7 @@ LibinputSetPropertyNaturalScroll(DeviceIntPtr dev,
 		if (*data != 0 && *data != 1)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		if (libinput_device_config_scroll_has_natural_scroll(device) == 0)
@@ -3999,7 +4796,7 @@ LibinputSetPropertySendEvents(DeviceIntPtr dev,
 	if (checkonly) {
 		uint32_t supported;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		supported = libinput_device_config_send_events_get_modes(device);
@@ -4033,7 +4830,7 @@ LibinputSetPropertyLeftHanded(DeviceIntPtr dev,
 		int supported;
 		int left_handed = *data;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		supported = libinput_device_config_left_handed_is_available(device);
@@ -4097,7 +4894,7 @@ LibinputSetPropertyScrollMethods(DeviceIntPtr dev,
 		if (__builtin_popcount(modes) > 1)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		supported = libinput_device_config_scroll_get_methods(device);
@@ -4130,7 +4927,7 @@ LibinputSetPropertyScrollButton(DeviceIntPtr dev,
 		uint32_t button = *data;
 		uint32_t supported;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		supported = libinput_device_pointer_has_button(device,
@@ -4154,7 +4951,7 @@ LibinputSetPropertyScrollButtonLock(DeviceIntPtr dev,
 	struct xf86libinput *driver_data = pInfo->private;
 	BOOL enabled;
 
-	if (val->format != 8 || val->type != XA_INTEGER || val->size != 1)
+	if (val->format != 8 || val->size != 1 || val->type != XA_INTEGER)
 		return BadMatch;
 
 	enabled = *(BOOL*)val->data;
@@ -4162,7 +4959,7 @@ LibinputSetPropertyScrollButtonLock(DeviceIntPtr dev,
 		if (enabled != 0 && enabled != 1)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 	} else {
 		driver_data->options.scroll_buttonlock = enabled;
@@ -4211,6 +5008,46 @@ LibinputSetPropertyClickMethod(DeviceIntPtr dev,
 
 	return Success;
 }
+
+static inline int
+LibinputSetPropertyClickfingerButtonmap(DeviceIntPtr dev,
+					Atom atom,
+					XIPropertyValuePtr val,
+					BOOL checkonly)
+{
+#if HAVE_LIBINPUT_CLICKFINGER_BUTTON_MAP
+	InputInfoPtr pInfo = dev->public.devicePrivate;
+	struct xf86libinput *driver_data = pInfo->private;
+	BOOL* data;
+	enum libinput_config_clickfinger_button_map map;
+
+	if (val->format != 8 || val->size != 2 || val->type != XA_INTEGER)
+		return BadMatch;
+
+	data = (BOOL*)val->data;
+
+	if (checkonly) {
+	    if ((data[0] && data[1]) || (!data[0] && !data[1]))
+		return BadValue;
+
+	    if (!xf86libinput_check_device(dev, atom))
+		return BadMatch;
+	}
+
+	if (data[0])
+		map = LIBINPUT_CONFIG_CLICKFINGER_MAP_LRM;
+	else if (data[1])
+		map = LIBINPUT_CONFIG_CLICKFINGER_MAP_LMR;
+	else
+		return BadValue;
+
+	if (!checkonly)
+		driver_data->options.clickfinger_button_map = map;
+
+#endif
+	return Success;
+}
+
 
 static inline int
 LibinputSetPropertyMiddleEmulation(DeviceIntPtr dev,
@@ -4304,6 +5141,7 @@ prop_draglock_set_pairs(struct xf86libinput *driver_data,
 	int data[MAX_BUTTONS + 1] = {0};
 	int i;
 	int highest = 0;
+	const unsigned int max = MAX_BUTTONS;
 
 	if (len >= ARRAY_SIZE(data))
 		return BadMatch;
@@ -4314,7 +5152,7 @@ prop_draglock_set_pairs(struct xf86libinput *driver_data,
 	dl = (checkonly) ? &dummy : &driver_data->draglock;
 
 	for (i = 0; i < len; i += 2) {
-		if (pairs[i] > MAX_BUTTONS)
+		if (pairs[i] > max)
 			return BadValue;
 
 		data[pairs[i]] = pairs[i+1];
@@ -4363,7 +5201,7 @@ LibinputSetPropertyHorizScroll(DeviceIntPtr dev,
 	struct xf86libinput *driver_data = pInfo->private;
 	BOOL enabled;
 
-	if (val->format != 8 || val->type != XA_INTEGER || val->size != 1)
+	if (val->format != 8 || val->size != 1 || val->type != XA_INTEGER)
 		return BadMatch;
 
 	enabled = *(BOOL*)val->data;
@@ -4371,10 +5209,38 @@ LibinputSetPropertyHorizScroll(DeviceIntPtr dev,
 		if (enabled != 0 && enabled != 1)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 	} else {
 		driver_data->options.horiz_scrolling_enabled = enabled;
+	}
+
+	return Success;
+}
+
+static inline int
+LibinputSetPropertyScrollPixelDistance(DeviceIntPtr dev,
+				       Atom atom,
+				       XIPropertyValuePtr val,
+				       BOOL checkonly)
+{
+	InputInfoPtr pInfo = dev->public.devicePrivate;
+	struct xf86libinput *driver_data = pInfo->private;
+	uint32_t dist;
+
+	if (val->format != 32 || val->size != 1 || val->type != XA_CARDINAL)
+		return BadMatch;
+
+	dist = *(BOOL*)val->data;
+	if (checkonly) {
+		if (dist < TOUCHPAD_SCROLL_DIST_MIN ||
+		    dist > TOUCHPAD_SCROLL_DIST_MAX)
+			return BadValue;
+
+		if (!xf86libinput_check_device(dev, atom))
+			return BadMatch;
+	} else {
+		driver_data->options.scroll_pixel_distance = dist;
 	}
 
 	return Success;
@@ -4400,7 +5266,7 @@ LibinputSetPropertyRotationAngle(DeviceIntPtr dev,
 		if (*angle < 0.0 || *angle >= 360.0)
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		if (libinput_device_config_rotation_is_available(device) == 0)
@@ -4444,7 +5310,7 @@ LibinputSetPropertyPressureCurve(DeviceIntPtr dev,
 				return BadValue;
 		}
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 
 		if (!cubic_bezier(controls, test_bezier, ARRAY_SIZE(test_bezier)))
@@ -4453,6 +5319,42 @@ LibinputSetPropertyPressureCurve(DeviceIntPtr dev,
 		xf86libinput_set_pressurecurve(driver_data, controls);
 		memcpy(driver_data->options.pressurecurve, controls,
 		       sizeof(controls));
+	}
+
+	return Success;
+}
+
+static inline int
+LibinputSetPropertyPressureRange(DeviceIntPtr dev,
+				 Atom atom,
+				 XIPropertyValuePtr val,
+				 BOOL checkonly)
+{
+	InputInfoPtr pInfo = dev->public.devicePrivate;
+	struct xf86libinput *driver_data = pInfo->private;
+	float *vals;
+	struct range range = { 0.0, 1.0 };
+
+	if (val->format != 32 || val->size != 2 || val->type != prop_float)
+		return BadMatch;
+
+	vals = val->data;
+	range.min = vals[0];
+	range.max = vals[1];
+
+	if (checkonly) {
+		if (range.min < 0.0 || range.max > 1.0 || range.min >= range.max)
+			return BadValue;
+
+		/* Disallow reducing the range to less than 20% of the range, mostly
+		 * to avoid footguns */
+		if (range.max - range.min < 0.2)
+			return BadValue;
+
+		if (!xf86libinput_check_device(dev, atom))
+			return BadMatch;
+	} else {
+		driver_data->options.pressure_range = range;
 	}
 
 	return Success;
@@ -4484,7 +5386,7 @@ LibinputSetPropertyAreaRatio(DeviceIntPtr dev,
 		    (area.x == 0 && area.y != 0))
 			return BadValue;
 
-		if (!xf86libinput_check_device (dev, atom))
+		if (!xf86libinput_check_device(dev, atom))
 			return BadMatch;
 	} else {
 		struct xf86libinput *other;
@@ -4514,9 +5416,37 @@ LibinputSetPropertyAreaRatio(DeviceIntPtr dev,
 	return Success;
 }
 
+static inline int
+LibinputSetPropertyHighResolutionScroll(DeviceIntPtr dev,
+					Atom atom,
+					XIPropertyValuePtr val,
+					BOOL checkonly)
+{
+	InputInfoPtr pInfo = dev->public.devicePrivate;
+	struct xf86libinput *driver_data = pInfo->private;
+	BOOL enabled;
+
+	if (val->format != 8 || val->size != 1 || val->type != XA_INTEGER)
+		return BadMatch;
+
+	enabled = *(BOOL*)val->data;
+	if (checkonly) {
+		if (enabled != 0 && enabled != 1)
+			return BadValue;
+
+		if (!xf86libinput_check_device(dev, atom))
+			return BadMatch;
+	} else {
+		driver_data->options.hires_scrolling_enabled = enabled;
+	}
+
+	return Success;
+}
+
 static int
-LibinputSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
-                 BOOL checkonly)
+LibinputSetProperty(DeviceIntPtr dev, Atom atom,
+		    XIPropertyValuePtr val,
+		    BOOL checkonly)
 {
 	int rc;
 
@@ -4535,6 +5465,16 @@ LibinputSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
 		rc = LibinputSetPropertyAccel(dev, atom, val, checkonly);
 	else if (atom == prop_accel_profile_enabled)
 		rc = LibinputSetPropertyAccelProfile(dev, atom, val, checkonly);
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	else if (atom == prop_accel_points_fallback ||
+	         atom == prop_accel_points_motion ||
+		 atom == prop_accel_points_scroll)
+		rc = LibinputSetPropertyAccelPoints(dev, atom, val, checkonly);
+	else if (atom == prop_accel_step_fallback ||
+	         atom == prop_accel_step_motion ||
+		 atom == prop_accel_step_scroll)
+		rc = LibinputSetPropertyAccelStep(dev, atom, val, checkonly);
+#endif
 	else if (atom == prop_natural_scroll)
 		rc = LibinputSetPropertyNaturalScroll(dev, atom, val, checkonly);
 	else if (atom == prop_sendevents_enabled)
@@ -4549,6 +5489,8 @@ LibinputSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
 		rc = LibinputSetPropertyScrollButtonLock(dev, atom, val, checkonly);
 	else if (atom == prop_click_method_enabled)
 		rc = LibinputSetPropertyClickMethod(dev, atom, val, checkonly);
+	else if (atom == prop_clickfinger_buttonmap)
+		rc = LibinputSetPropertyClickfingerButtonmap(dev, atom, val, checkonly);
 	else if (atom == prop_middle_emulation)
 		rc = LibinputSetPropertyMiddleEmulation(dev, atom, val, checkonly);
 	else if (atom == prop_disable_while_typing)
@@ -4557,6 +5499,8 @@ LibinputSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
 		rc = LibinputSetPropertyDragLockButtons(dev, atom, val, checkonly);
 	else if (atom == prop_horiz_scroll)
 		rc = LibinputSetPropertyHorizScroll(dev, atom, val, checkonly);
+	else if (atom == prop_scroll_pixel_distance)
+		rc = LibinputSetPropertyScrollPixelDistance(dev, atom, val, checkonly);
 	else if (atom == prop_mode_groups) {
 		InputInfoPtr pInfo = dev->public.devicePrivate;
 		struct xf86libinput *driver_data = pInfo->private;
@@ -4570,33 +5514,43 @@ LibinputSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
 		rc = LibinputSetPropertyRotationAngle(dev, atom, val, checkonly);
 	else if (atom == prop_pressurecurve)
 		rc = LibinputSetPropertyPressureCurve(dev, atom, val, checkonly);
+	else if (atom == prop_pressure_range)
+		rc = LibinputSetPropertyPressureRange(dev, atom, val, checkonly);
 	else if (atom == prop_area_ratio)
 		rc = LibinputSetPropertyAreaRatio(dev, atom, val, checkonly);
-	else if (atom == prop_device || atom == prop_product_id ||
-		 atom == prop_tap_default ||
-		 atom == prop_tap_drag_default ||
-		 atom == prop_tap_drag_lock_default ||
-		 atom == prop_tap_buttonmap_default ||
-		 atom == prop_calibration_default ||
-		 atom == prop_accel_default ||
+	else if (atom == prop_hires_scroll)
+		rc = LibinputSetPropertyHighResolutionScroll(dev, atom, val, checkonly);
+	else if (atom == prop_accel_default ||
 		 atom == prop_accel_profile_default ||
-		 atom == prop_natural_scroll_default ||
-		 atom == prop_sendevents_default ||
-		 atom == prop_sendevents_available ||
-		 atom == prop_left_handed_default ||
-		 atom == prop_scroll_method_default ||
-		 atom == prop_scroll_methods_available ||
-		 atom == prop_scroll_button_default ||
-		 atom == prop_scroll_buttonlock_default ||
+		 atom == prop_calibration_default ||
 		 atom == prop_click_method_default ||
 		 atom == prop_click_methods_available ||
-		 atom == prop_middle_emulation_default ||
+		 atom == prop_clickfinger_buttonmap_default ||
 		 atom == prop_disable_while_typing_default ||
+		 atom == prop_left_handed_default ||
+		 atom == prop_middle_emulation_default ||
 		 atom == prop_mode_groups_available ||
 		 atom == prop_mode_groups_buttons ||
 		 atom == prop_mode_groups_rings ||
 		 atom == prop_mode_groups_strips ||
-		 atom == prop_rotation_angle_default)
+		 atom == prop_natural_scroll_default ||
+		 atom == prop_product_id ||
+		 atom == prop_pressure_range_default ||
+		 atom == prop_rotation_angle_default ||
+		 atom == prop_scroll_button_default ||
+		 atom == prop_scroll_buttonlock_default ||
+		 atom == prop_scroll_method_default ||
+		 atom == prop_scroll_methods_available ||
+		 atom == prop_scroll_pixel_distance_default ||
+		 atom == prop_sendevents_available ||
+		 atom == prop_sendevents_default ||
+		 atom == prop_serial ||
+		 atom == prop_tap_buttonmap_default ||
+		 atom == prop_tap_default ||
+		 atom == prop_tap_drag_default ||
+		 atom == prop_tap_drag_lock_default ||
+		 atom == prop_tool_id ||
+		 atom == prop_device)
 		return BadAccess; /* read-only */
 	else
 		return Success;
@@ -4811,7 +5765,24 @@ LibinputInitAccelProperty(DeviceIntPtr dev,
 	float speed = driver_data->options.speed;
 	uint32_t profile_mask;
 	enum libinput_config_accel_profile profile;
-	BOOL profiles[2] = {FALSE};
+	BOOL profiles[3] = {FALSE};
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	float custom_points_fallback[CUSTOM_ACCEL_NPOINTS_MAX] = {0};
+	float custom_points_motion[CUSTOM_ACCEL_NPOINTS_MAX] = {0};
+	float custom_points_scroll[CUSTOM_ACCEL_NPOINTS_MAX] = {0};
+	size_t custom_npoints_fallback = driver_data->options.accel_points_fallback.npoints;
+	size_t custom_npoints_motion = driver_data->options.accel_points_motion.npoints;
+	size_t custom_npoints_scroll = driver_data->options.accel_points_scroll.npoints;
+	float custom_step_fallback = driver_data->options.accel_points_fallback.step;
+	float custom_step_motion = driver_data->options.accel_points_motion.step;
+	float custom_step_scroll = driver_data->options.accel_points_scroll.step;
+
+	for (size_t idx = 0; idx < CUSTOM_ACCEL_NPOINTS_MAX; idx++) {
+		custom_points_fallback[idx] = driver_data->options.accel_points_fallback.points[idx];
+		custom_points_motion[idx] = driver_data->options.accel_points_motion.points[idx];
+		custom_points_scroll[idx] = driver_data->options.accel_points_scroll.points[idx];
+	}
+#endif
 
 	if (!subdevice_has_capabilities(dev, CAP_POINTER))
 		return;
@@ -4839,8 +5810,12 @@ LibinputInitAccelProperty(DeviceIntPtr dev,
 
 	if (profile_mask & LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE)
 		profiles[0] = TRUE;
-	if (profile_mask & LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE)
+	if (profile_mask & LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT)
 		profiles[1] = TRUE;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	if (profile_mask & LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM)
+		profiles[2] = TRUE;
+#endif
 
 	prop_accel_profiles_available = LibinputMakeProperty(dev,
 							     LIBINPUT_PROP_ACCEL_PROFILES_AVAILABLE,
@@ -4860,6 +5835,11 @@ LibinputInitAccelProperty(DeviceIntPtr dev,
 	case LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT:
 		profiles[1] = TRUE;
 		break;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	case LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM:
+		profiles[2] = TRUE;
+		break;
+#endif
 	default:
 		break;
 	}
@@ -4882,6 +5862,11 @@ LibinputInitAccelProperty(DeviceIntPtr dev,
 	case LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT:
 		profiles[1] = TRUE;
 		break;
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	case LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM:
+		profiles[2] = TRUE;
+		break;
+#endif
 	default:
 		break;
 	}
@@ -4894,6 +5879,35 @@ LibinputInitAccelProperty(DeviceIntPtr dev,
 	if (!prop_accel_profile_default)
 		return;
 
+#if HAVE_LIBINPUT_CUSTOM_ACCEL
+	prop_accel_points_fallback = LibinputMakeProperty(dev,
+							  LIBINPUT_PROP_ACCEL_CUSTOM_POINTS_FALLBACK,
+							  prop_float, 32,
+							  custom_npoints_fallback,
+							  custom_points_fallback);
+	prop_accel_step_fallback = LibinputMakeProperty(dev,
+							LIBINPUT_PROP_ACCEL_CUSTOM_STEP_FALLBACK,
+							prop_float, 32, 1,
+							&custom_step_fallback);
+	prop_accel_points_motion = LibinputMakeProperty(dev,
+							LIBINPUT_PROP_ACCEL_CUSTOM_POINTS_MOTION,
+							prop_float, 32,
+							custom_npoints_motion,
+							custom_points_motion);
+	prop_accel_step_motion = LibinputMakeProperty(dev,
+						      LIBINPUT_PROP_ACCEL_CUSTOM_STEP_MOTION,
+						      prop_float, 32, 1,
+						      &custom_step_motion);
+	prop_accel_points_scroll = LibinputMakeProperty(dev,
+							LIBINPUT_PROP_ACCEL_CUSTOM_POINTS_SCROLL,
+							prop_float, 32,
+							custom_npoints_scroll,
+							custom_points_scroll);
+	prop_accel_step_scroll = LibinputMakeProperty(dev,
+						      LIBINPUT_PROP_ACCEL_CUSTOM_STEP_SCROLL,
+						      prop_float, 32, 1,
+						      &custom_step_scroll);
+#endif
 }
 
 static void
@@ -4988,7 +6002,7 @@ LibinputInitLeftHandedProperty(DeviceIntPtr dev,
 {
 	BOOL left_handed = driver_data->options.left_handed;
 
-	if (!subdevice_has_capabilities(dev, CAP_POINTER|CAP_TABLET))
+	if (!subdevice_has_capabilities(dev, CAP_POINTER|CAP_TABLET|CAP_TABLET_TOOL))
 		return;
 
 	if (!libinput_device_config_left_handed_is_available(device) ||
@@ -5115,6 +6129,32 @@ LibinputInitScrollMethodsProperty(DeviceIntPtr dev,
 }
 
 static void
+LibinputInitScrollPixelDistanceProperty(DeviceIntPtr dev,
+					struct xf86libinput *driver_data,
+					struct libinput_device *device)
+{
+	CARD32 dist = driver_data->options.scroll_pixel_distance;
+
+	if (!subdevice_has_capabilities(dev, CAP_POINTER))
+		return;
+
+	if (!xf86libinput_want_scroll_distance_option(device))
+		return;
+
+	prop_scroll_pixel_distance = LibinputMakeProperty(dev,
+							  LIBINPUT_PROP_SCROLL_PIXEL_DISTANCE,
+							  XA_CARDINAL, 32,
+							  1, &dist);
+	if (!prop_scroll_pixel_distance)
+		return;
+
+	prop_scroll_pixel_distance_default = LibinputMakeProperty(dev,
+								  LIBINPUT_PROP_SCROLL_PIXEL_DISTANCE_DEFAULT,
+								  XA_CARDINAL, 32,
+								  1, &dist);
+}
+
+static void
 LibinputInitClickMethodsProperty(DeviceIntPtr dev,
 				 struct xf86libinput *driver_data,
 				 struct libinput_device *device)
@@ -5185,6 +6225,63 @@ LibinputInitClickMethodsProperty(DeviceIntPtr dev,
 							 XA_INTEGER, 8,
 							 ARRAY_SIZE(methods),
 							 methods);
+}
+
+static void
+LibinputInitClickfingerButtonmapProperty(DeviceIntPtr dev,
+				 	 struct xf86libinput *driver_data,
+				 	 struct libinput_device *device)
+{
+#if HAVE_LIBINPUT_CLICKFINGER_BUTTON_MAP
+	enum libinput_config_clickfinger_button_map map;
+	BOOL data[2] = {0};
+
+	if (!subdevice_has_capabilities(dev, CAP_POINTER))
+		return;
+
+	uint32_t click_methods = libinput_device_config_click_get_methods(device);
+	if ((click_methods & LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER) == 0)
+		return;
+
+	map = driver_data->options.clickfinger_button_map;
+
+	switch (map) {
+	case LIBINPUT_CONFIG_CLICKFINGER_MAP_LRM:
+		data[0] = 1;
+		break;
+	case LIBINPUT_CONFIG_CLICKFINGER_MAP_LMR:
+		data[1] = 1;
+		break;
+	default:
+		break;
+	}
+
+	prop_clickfinger_buttonmap = LibinputMakeProperty(dev,
+							  LIBINPUT_PROP_CLICKFINGER_BUTTONMAP,
+							  XA_INTEGER, 8,
+							  2, data);
+	if (!prop_clickfinger_buttonmap)
+		return;
+
+	map = libinput_device_config_click_get_default_clickfinger_button_map(device);
+	memset(data, 0, sizeof(data));
+
+	switch (map) {
+	case LIBINPUT_CONFIG_CLICKFINGER_MAP_LRM:
+		data[0] = 1;
+		break;
+	case LIBINPUT_CONFIG_CLICKFINGER_MAP_LMR:
+		data[1] = 1;
+		break;
+	default:
+		break;
+	}
+
+	prop_clickfinger_buttonmap_default = LibinputMakeProperty(dev,
+								  LIBINPUT_PROP_CLICKFINGER_BUTTONMAP_DEFAULT,
+								  XA_INTEGER, 8,
+								  2, data);
+#endif
 }
 
 static void
@@ -5481,6 +6578,44 @@ LibinputInitPressureCurveProperty(DeviceIntPtr dev,
 }
 
 static void
+LibinputInitPressureRangeProperty(DeviceIntPtr dev,
+				  struct xf86libinput *driver_data)
+{
+#if HAVE_LIBINPUT_PRESSURE_RANGE
+	struct libinput_tablet_tool *tool = driver_data->tablet_tool;
+	const struct range *range = &driver_data->options.pressure_range;
+	float data[2] = {
+		range->min,
+		range->max,
+	};
+
+	if ((driver_data->capabilities & CAP_TABLET_TOOL) == 0)
+		return;
+
+
+	if (!tool || !libinput_tablet_tool_config_pressure_range_is_available(tool))
+		return;
+
+	prop_pressure_range = LibinputMakeProperty(dev,
+						   LIBINPUT_PROP_TABLET_TOOL_PRESSURE_RANGE,
+						   prop_float, 32,
+						   2, &data);
+	if (!prop_pressure_range)
+		return;
+
+	data[0] = libinput_tablet_tool_config_pressure_range_get_default_minimum(tool);
+	data[1] = libinput_tablet_tool_config_pressure_range_get_default_maximum(tool);
+	prop_pressure_range_default = LibinputMakeProperty(dev,
+							   LIBINPUT_PROP_TABLET_TOOL_PRESSURE_RANGE_DEFAULT,
+							   prop_float, 32,
+							   2, &data);
+
+	if (!prop_pressure_range_default)
+		return;
+#endif
+}
+
+static void
 LibinputInitTabletAreaRatioProperty(DeviceIntPtr dev,
 				    struct xf86libinput *driver_data)
 {
@@ -5497,6 +6632,52 @@ LibinputInitTabletAreaRatioProperty(DeviceIntPtr dev,
 					       LIBINPUT_PROP_TABLET_TOOL_AREA_RATIO,
 					       XA_CARDINAL, 32,
 					       2, data);
+}
+
+static void
+LibinputInitTabletSerialProperty(DeviceIntPtr dev,
+				 struct xf86libinput *driver_data)
+{
+	struct libinput_tablet_tool *tool = driver_data->tablet_tool;
+	uint32_t serial, tool_id;
+
+	if ((driver_data->capabilities & CAP_TABLET_TOOL) == 0)
+		return;
+
+	if (!tool)
+		return;
+
+	/* Serial prop is always created to indicate when we don't have a serial */
+	serial = libinput_tablet_tool_get_serial(tool);
+	prop_serial = LibinputMakeProperty(dev,
+					  LIBINPUT_PROP_TABLET_TOOL_SERIAL,
+					  XA_CARDINAL, 32,
+					  1, &serial);
+
+	/* The tool ID prop is only created if we have a known tool id */
+	tool_id = libinput_tablet_tool_get_tool_id(tool);
+	if (tool_id) {
+		prop_tool_id = LibinputMakeProperty(dev,
+						    LIBINPUT_PROP_TABLET_TOOL_ID,
+						    XA_CARDINAL, 32,
+						    1, &tool_id);
+	}
+}
+
+static void
+LibinputInitHighResolutionScrollProperty(DeviceIntPtr dev,
+					 struct xf86libinput *driver_data,
+					 struct libinput_device *device)
+{
+	BOOL enabled = driver_data->options.hires_scrolling_enabled;
+
+	if ((driver_data->capabilities & CAP_POINTER) == 0)
+		return;
+
+	prop_hires_scroll = LibinputMakeProperty(dev,
+						 LIBINPUT_PROP_HIRES_WHEEL_SCROLL_ENABLED,
+						 XA_INTEGER, 8,
+						 1, &enabled);
 }
 
 static void
@@ -5519,6 +6700,7 @@ LibinputInitProperty(DeviceIntPtr dev)
 	LibinputInitDisableWhileTypingProperty(dev, driver_data, device);
 	LibinputInitScrollMethodsProperty(dev, driver_data, device);
 	LibinputInitClickMethodsProperty(dev, driver_data, device);
+	LibinputInitClickfingerButtonmapProperty(dev, driver_data, device);
 	LibinputInitMiddleEmulationProperty(dev, driver_data, device);
 	LibinputInitRotationAngleProperty(dev, driver_data, device);
 	LibinputInitAccelProperty(dev, driver_data, device);
@@ -5555,6 +6737,10 @@ LibinputInitProperty(DeviceIntPtr dev)
 
 	LibinputInitDragLockProperty(dev, driver_data);
 	LibinputInitHorizScrollProperty(dev, driver_data);
+	LibinputInitScrollPixelDistanceProperty(dev, driver_data, device);
 	LibinputInitPressureCurveProperty(dev, driver_data);
+	LibinputInitPressureRangeProperty(dev, driver_data);
 	LibinputInitTabletAreaRatioProperty(dev, driver_data);
+	LibinputInitTabletSerialProperty(dev, driver_data);
+	LibinputInitHighResolutionScrollProperty(dev, driver_data, device);
 }
