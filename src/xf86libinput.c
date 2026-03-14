@@ -1911,6 +1911,7 @@ calculate_axis_value(struct xf86libinput *driver_data,
 		value = value/dist * SCROLL_INCREMENT * 8;
 	}
 
+	value *= 1.5;
 	*value_out = value;
 
 	return true;
